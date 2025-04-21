@@ -1,6 +1,6 @@
 # RabbitMQ Web OCPP plugin
 
-This plugin provides is a thin translator layer for OCPP-over-WebSockets to RabbitMQ AMQP protocol. Both version `1.6J` and `2.x` should be supported as the base JSON format array was kept backwards compatible, even tho many of the action names and payload are changed.
+This plugin provides a thin translator layer for OCPP-over-WebSockets to RabbitMQ AMQP protocol. Both version `1.6J` and `2.x` should be supported as the base JSON format array was kept backwards compatible, even tho many of the action names and payload are changed.
 
 ## Installation
 
@@ -28,6 +28,7 @@ when building plugins from source.
 
 ## Copyright and License
 
-(c) 2007-2024 Broadcom. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+(c) 2007-2024 Broadcom. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.  
+(c) 2025 VAMPIRE BYTE SRL. All Rights Reserved.
 
-Released under the same license as RabbitMQ. See LICENSE for details.
+Released under the same license as RabbitMQ. See [LICENSE](./LICENSE) for details.
