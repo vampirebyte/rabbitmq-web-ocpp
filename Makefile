@@ -1,10 +1,10 @@
-PROJECT = rabbitmq_web_mqtt
-PROJECT_DESCRIPTION = RabbitMQ MQTT-over-WebSockets adapter
-PROJECT_MOD = rabbit_web_mqtt_app
+PROJECT = rabbitmq_web_ocpp
+PROJECT_DESCRIPTION = RabbitMQ OCPP-J-to-AMQP adapter
+PROJECT_MOD = rabbit_web_ocpp_app
 
 define PROJECT_ENV
 [
-	    {tcp_config, [{port, 15675}]},
+	    {tcp_config, [{port, 19520}]},
 	    {ssl_config, []},
 	    {num_tcp_acceptors, 10},
 	    {num_ssl_acceptors, 10},
@@ -13,30 +13,22 @@ define PROJECT_ENV
 	  ]
 endef
 
-# We do not need QUIC as dependency of emqtt.
-BUILD_WITHOUT_QUIC=1
-export BUILD_WITHOUT_QUIC
-
 LOCAL_DEPS = ssl
-DEPS = rabbit cowboy rabbitmq_mqtt
-TEST_DEPS = emqtt rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_management rabbitmq_stomp rabbitmq_consistent_hash_exchange
+DEPS = rabbit cowboy
+TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_management rabbitmq_stomp rabbitmq_consistent_hash_exchange
 
-PLT_APPS += rabbitmqctl elixir cowlib
+PLT_APPS += rabbitmq_cli elixir cowlib
 
 # FIXME: Add Ranch as a BUILD_DEPS to be sure the correct version is picked.
 # See rabbitmq-components.mk.
 BUILD_DEPS += ranch
 
-dep_emqtt = git https://github.com/emqx/emqtt.git 1.11.0
-
 DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-plugin.mk
 DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
 
-include ../../rabbitmq-components.mk
-include ../../erlang.mk
+# The monorepo structure of RabbitMQ does not work for OOT plugins.
+DEPS_DIR ?= $(abspath ../rabbitmq-server/deps)
+ERLANG_MK_TMP ?= $(abspath ./.erlang.mk)
 
-# We are using mqtt_shared_SUITE from rabbitmq_mqtt.
-CT_OPTS += -pa ../rabbitmq_mqtt/test/
-
-test-build::
-	$(verbose) $(MAKE) -C ../rabbitmq_mqtt test-dir
+include ../rabbitmq-server/rabbitmq-components.mk
+include ../rabbitmq-server/erlang.mk

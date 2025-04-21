@@ -5,7 +5,7 @@
 %% Copyright (c) 2007-2024 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 %%
 
--module(rabbit_web_mqtt_app).
+-module(rabbit_web_ocpp_app).
 
 -behaviour(application).
 -export([
@@ -24,8 +24,8 @@
 
 -import(rabbit_misc, [pget/2]).
 
--define(TCP_PROTOCOL, 'http/web-mqtt').
--define(TLS_PROTOCOL, 'https/web-mqtt').
+-define(TCP_PROTOCOL, 'http/web-ocpp').
+-define(TLS_PROTOCOL, 'https/web-ocpp').
 
 %%
 %% API
@@ -33,7 +33,7 @@
 
 -spec start(_, _) -> {ok, pid()}.
 start(_Type, _StartArgs) ->
-    mqtt_init(),
+    ocpp_init(),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 -spec prep_stop(term()) -> term().
@@ -71,24 +71,29 @@ emit_connection_info(Items, Ref, AggregatorPid, Pids) ->
     rabbit_control_misc:emitting_map_with_exit_handler(
       AggregatorPid, Ref,
       fun(Pid) ->
-              rabbit_web_mqtt_handler:info(Pid, Items)
+              rabbit_web_ocpp_handler:info(Pid, Items)
       end, Pids).
 %%
 %% Implementation
 %%
 
-mqtt_init() ->
+ocpp_init() ->
     CowboyOpts0  = maps:from_list(get_env(cowboy_opts, [])),
     CowboyWsOpts = maps:from_list(get_env(cowboy_ws_opts, [])),
     TcpConfig = get_env(tcp_config, []),
     SslConfig = get_env(ssl_config, []),
+    %% To derive its connection URL, the Charge Point modifies the OCPP-J endpoint URL by appending to the
+    %% path first a '/' (U+002F SOLIDUS) and then a string uniquely identifying the Charge Point. 
+    %% This uniquely identifying string has to be percent-encoded as necessary as described in [RFC3986].
+    %% [OCPP 1.6 JSON spec §3.1.1].
+    FullPath = get_env(ws_path, "/ocpp") ++ "/:client_id",
     Routes = cowboy_router:compile([{'_', [
-        {get_env(ws_path, "/ws"), rabbit_web_mqtt_handler, [{ws_opts, CowboyWsOpts}]}
+        {FullPath, rabbit_web_ocpp_handler, [{ws_opts, CowboyWsOpts}]}
     ]}]),
     CowboyOpts = CowboyOpts0#{
                  env => #{dispatch => Routes},
                  proxy_header => get_env(proxy_protocol, false),
-                 stream_handlers => [rabbit_web_mqtt_stream_handler, cowboy_stream_h]
+                 stream_handlers => [rabbit_web_ocpp_stream_handler, cowboy_stream_h]
                 },
     start_tcp_listener(TcpConfig, CowboyOpts),
     start_tls_listener(SslConfig, CowboyOpts).
@@ -116,7 +121,7 @@ start_tcp_listener(TCPConf0, CowboyOpts) ->
             throw(ErrTCP)
     end,
     listener_started(?TCP_PROTOCOL, TCPConf),
-    rabbit_log:info("rabbit_web_mqtt: listening for HTTP connections on ~s:~w",
+    rabbit_log:info("rabbit_web_ocpp: listening for HTTP connections on ~s:~w",
                     [IpStr, Port]).
 
 
@@ -144,7 +149,7 @@ start_tls_listener(TLSConf0, CowboyOpts) ->
             throw(ErrTLS)
     end,
     listener_started(?TLS_PROTOCOL, TLSConf),
-    rabbit_log:info("rabbit_web_mqtt: listening for HTTPS connections on ~s:~w",
+    rabbit_log:info("rabbit_web_ocpp: listening for HTTPS connections on ~s:~w",
                     [TLSIpStr, TLSPort]).
 
 listener_started(Protocol, Listener) ->
@@ -167,14 +172,14 @@ listener_started(Protocol, Listener) ->
 
 get_tcp_conf(TCPConf0) ->
     TCPConf1 = case proplists:get_value(port, TCPConf0) of
-                   undefined -> [{port, 15675}|TCPConf0];
+                   undefined -> [{port, 19520}|TCPConf0];
                    _ -> TCPConf0
                end,
     get_ip_port(TCPConf1).
 
 get_tls_conf(TLSConf0) ->
     TLSConf1 = case proplists:get_value(port, TLSConf0) of
-                   undefined -> [{port, 15675}|proplists:delete(port, TLSConf0)];
+                   undefined -> [{port, 19521}|proplists:delete(port, TLSConf0)];
                    _ -> TLSConf0
                end,
     get_ip_port(TLSConf1).
@@ -196,4 +201,4 @@ get_max_connections() ->
   get_env(max_connections, infinity).
 
 get_env(Key, Default) ->
-    rabbit_misc:get_env(rabbitmq_web_mqtt, Key, Default).
+    rabbit_misc:get_env(rabbitmq_web_ocpp, Key, Default).

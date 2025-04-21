@@ -6,7 +6,7 @@
 
 -module('Elixir.RabbitMQ.CLI.Ctl.Commands.ListWebMqttConnectionsCommand').
 
--include_lib("rabbitmq_mqtt/include/rabbit_mqtt.hrl").
+-include_lib("rabbit_web_ocpp.hrl").
 
 -behaviour('Elixir.RabbitMQ.CLI.CommandBehaviour').
 
@@ -33,7 +33,7 @@ aliases() -> [{'V', verbose}].
 description() -> <<"Lists all Web MQTT connections">>.
 
 help_section() ->
-    {plugin, web_mqtt}.
+    {plugin, web_ocpp}.
 
 validate(Args, _) ->
     InfoItems = lists:map(fun atom_to_list/1, ?INFO_ITEMS),
@@ -49,7 +49,7 @@ merge_defaults(Args, Opts) ->
     {Args, maps:merge(#{verbose => false}, Opts)}.
 
 usage() ->
-    <<"list_web_mqtt_connections [<column> ...]">>.
+    <<"list_web_ocpp_connections [<column> ...]">>.
 
 usage_additional() ->
     Prefix = <<" must be one of ">>,
@@ -73,14 +73,14 @@ run(Args, #{node := NodeName,
 
     'Elixir.RabbitMQ.CLI.Ctl.RpcStream':receive_list_items(
         NodeName,
-        rabbit_web_mqtt_app,
+        rabbit_web_ocpp_app,
         emit_connection_info_all,
         [Nodes, InfoKeys],
         Timeout,
         InfoKeys,
         length(Nodes)).
 
-banner(_, _) -> <<"Listing Web MQTT connections ...">>.
+banner(_, _) -> <<"Listing Web OCPP connections ...">>.
 
 output(Result, _Opts) ->
     'Elixir.RabbitMQ.CLI.DefaultOutput':output(Result).

@@ -4,7 +4,7 @@
 %%
 %% Copyright (c) 2007-2024 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 %%
--module(rabbit_web_mqtt_stream_handler).
+-module(rabbit_web_ocpp_stream_handler).
 
 -behavior(cowboy_stream).
 
@@ -26,7 +26,7 @@ data(StreamID, IsFin, Data, State = #state{next = Next0}) ->
     {Commands, State#state{next = Next}}.
 
 info(StreamID, {switch_protocol, Headers, _, InitialState}, State) ->
-    do_info(StreamID, {switch_protocol, Headers, rabbit_web_mqtt_handler, InitialState}, State);
+    do_info(StreamID, {switch_protocol, Headers, rabbit_web_ocpp_handler, InitialState}, State);
 info(StreamID, Info, State) ->
     do_info(StreamID, Info, State).
 
