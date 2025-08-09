@@ -8,6 +8,10 @@
 -module(rabbit_web_ocpp_app).
 
 -behaviour(application).
+
+-include_lib("rabbit_common/include/rabbit.hrl").
+-include("rabbit_web_ocpp.hrl").
+
 -export([
     start/2,
     prep_stop/1,
@@ -24,9 +28,6 @@
 
 -import(rabbit_misc, [pget/2]).
 
--define(TCP_PROTOCOL, 'http/web-ocpp').
--define(TLS_PROTOCOL, 'https/web-ocpp').
-
 %%
 %% API
 %%
@@ -42,16 +43,33 @@ prep_stop(State) ->
 
 -spec stop(_) -> ok.
 stop(_State) ->
-    _ = rabbit_networking:stop_ranch_listener_of_protocol(?TCP_PROTOCOL),
-    _ = rabbit_networking:stop_ranch_listener_of_protocol(?TLS_PROTOCOL),
+    _ = rabbit_networking:stop_ranch_listener_of_protocol(?OCPP_TCP_PROTOCOL),
+    _ = rabbit_networking:stop_ranch_listener_of_protocol(?OCPP_TLS_PROTOCOL),
     ok.
 
-init([]) -> {ok, {{one_for_one, 1, 5}, []}}.
+init([]) ->
+    %% Use separate process group scope per RabbitMQ node. This achieves a local-only
+    %% process group which requires less memory with millions of connections.
+    PgScope = rabbit:pg_local_scope(?PG_SCOPE),
+    persistent_term:put(?PG_SCOPE, PgScope),
+
+    %% Define the children for the supervision tree
+    Children = [
+        #{id => PgScope,
+          start => {pg, start_link, [PgScope]},
+          restart => transient,
+          shutdown => ?WORKER_WAIT,
+          type => worker,
+          modules => [pg]}
+    ],
+
+    %% Return the supervision strategy and children
+    {ok, {{one_for_one, 1, 5}, Children}}.
 
 -spec list_connections() -> [pid()].
 list_connections() ->
-    PlainPids = rabbit_networking:list_local_connections_of_protocol(?TCP_PROTOCOL),
-    TLSPids   = rabbit_networking:list_local_connections_of_protocol(?TLS_PROTOCOL),
+    PlainPids = rabbit_networking:list_local_connections_of_protocol(?OCPP_TCP_PROTOCOL),
+    TLSPids   = rabbit_networking:list_local_connections_of_protocol(?OCPP_TLS_PROTOCOL),
     PlainPids ++ TLSPids.
 
 -spec emit_connection_info_all([node()], rabbit_types:info_keys(), reference(), pid()) -> term().
@@ -80,13 +98,14 @@ emit_connection_info(Items, Ref, AggregatorPid, Pids) ->
 ocpp_init() ->
     CowboyOpts0  = maps:from_list(get_env(cowboy_opts, [])),
     CowboyWsOpts = maps:from_list(get_env(cowboy_ws_opts, [])),
+    rabbit_log:info("OCPP Cowboy options: ~p", [CowboyWsOpts]),
     TcpConfig = get_env(tcp_config, []),
     SslConfig = get_env(ssl_config, []),
     %% To derive its connection URL, the Charge Point modifies the OCPP-J endpoint URL by appending to the
     %% path first a '/' (U+002F SOLIDUS) and then a string uniquely identifying the Charge Point. 
     %% This uniquely identifying string has to be percent-encoded as necessary as described in [RFC3986].
     %% [OCPP 1.6 JSON spec §3.1.1].
-    FullPath = get_env(ws_path, "/ocpp") ++ "/:client_id",
+    FullPath = get_env(ws_path, "/ocpp") ++ "/:vhost/:client_id",
     Routes = cowboy_router:compile([{'_', [
         {FullPath, rabbit_web_ocpp_handler, [{ws_opts, CowboyWsOpts}]}
     ]}]),
@@ -120,7 +139,7 @@ start_tcp_listener(TCPConf0, CowboyOpts) ->
               [ErrTCP, TCPConf]),
             throw(ErrTCP)
     end,
-    listener_started(?TCP_PROTOCOL, TCPConf),
+    listener_started(?OCPP_TCP_PROTOCOL, TCPConf),
     rabbit_log:info("rabbit_web_ocpp: listening for HTTP connections on ~s:~w",
                     [IpStr, Port]).
 
@@ -148,7 +167,7 @@ start_tls_listener(TLSConf0, CowboyOpts) ->
               [ErrTLS, TLSConf]),
             throw(ErrTLS)
     end,
-    listener_started(?TLS_PROTOCOL, TLSConf),
+    listener_started(?OCPP_TLS_PROTOCOL, TLSConf),
     rabbit_log:info("rabbit_web_ocpp: listening for HTTPS connections on ~s:~w",
                     [TLSIpStr, TLSPort]).
 
@@ -201,4 +220,4 @@ get_max_connections() ->
   get_env(max_connections, infinity).
 
 get_env(Key, Default) ->
-    rabbit_misc:get_env(rabbitmq_web_ocpp, Key, Default).
+    rabbit_misc:get_env(?APP_NAME, Key, Default).

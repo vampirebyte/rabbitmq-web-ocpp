@@ -5,12 +5,25 @@
 %% Copyright (c) 2025 VAMPIRE BYTE SRL. All Rights Reserved.
 %%
 
+-define(APP_NAME, rabbitmq_web_ocpp).
+-define(PG_SCOPE, pg_scope_rabbitmq_web_ocpp_clientid).
+-define(DEFAULT_IDLE_TIMEOUT_MS, 600_000). %% 10 minutes
+
 -type option(T) :: undefined | T.
+-type client_id() :: binary().
+-type user_property() :: [{binary(), binary()}].
+
+%% Close frame status codes as defined in
+%% https://www.rfc-editor.org/rfc/rfc6455#section-7.4.1
+-define(CLOSE_NORMAL, 1000).
+-define(CLOSE_SERVER_GOING_DOWN, 1001).
+-define(CLOSE_PROTOCOL_ERROR, 1002).
+-define(CLOSE_UNACCEPTABLE_DATA_TYPE, 1003).
+-define(CLOSE_INVALID_PAYLOAD, 1007).
+-define(CLOSE_POLICY_VIOLATION, 1008). % e.g., unsupported subprotocol
 
 %% WebSocket Subprotocol Name Registry
 %% https://www.iana.org/assignments/websocket/websocket.xml
--define(OCPP_SUPPORTED_PROTOCOLS, [<<"ocpp1.2">>, <<"ocpp1.5">>, <<"ocpp1.6">>, <<"ocpp2.0">>, <<"ocpp2.0.1">>, <<"ocpp2.1">>]).
-
 -define(OCPP_PROTO_V12, ocpp12).
 -define(OCPP_PROTO_V15, ocpp15).
 -define(OCPP_PROTO_V16, ocpp16).
@@ -26,11 +39,35 @@
         | ?OCPP_PROTO_V201
         | ?OCPP_PROTO_V21.
 
+-define(OCPP_PROTO_TO_ATOM(Proto), case Proto of
+    <<"ocpp1.2">> -> ?OCPP_PROTO_V12;
+    <<"ocpp1.5">> -> ?OCPP_PROTO_V15;
+    <<"ocpp1.6">> -> ?OCPP_PROTO_V16;
+    <<"ocpp2.0">> -> ?OCPP_PROTO_V20;
+    <<"ocpp2.0.1">> -> ?OCPP_PROTO_V201;
+    <<"ocpp2.1">> -> ?OCPP_PROTO_V21;
+    _ -> undefined
+end).
+
+-define(OCPP_TCP_PROTOCOL, 'ws/ocpp').
+-define(OCPP_TLS_PROTOCOL, 'wss/ocpp').
+
 -define(OCPP_MESSAGE_TYPE_CALL, 2). % Request
 -define(OCPP_MESSAGE_TYPE_CALLRESULT, 3). % Response success
 -define(OCPP_MESSAGE_TYPE_CALLERROR, 4). % Response error
 -define(OCPP_MESSAGE_TYPE_CALLRESULTERROR, 5). % OCPP 2.1 only
 -define(OCPP_MESSAGE_TYPE_SEND, 6). % OCPP 2.1 only
+
+%% Internal representation of an OCPP message
+-record(ocpp_msg, {
+    msg_type :: integer(), % Extracted MessageTypeID
+    msg_id :: binary(), % Extracted MessageID (as binary string)
+    action :: binary() | undefined, % Extracted Action for CALL/SEND types
+    payload :: iolist(), % Original JSON payload
+    client_id :: binary() % Originating CP identifier (e.g., from reply_to)
+}).
+
+-type ocpp_msg() :: #ocpp_msg{}.
 
 -define(ITEMS,
         [pid,
