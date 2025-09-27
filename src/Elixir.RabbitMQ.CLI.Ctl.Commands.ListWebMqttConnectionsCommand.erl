@@ -4,7 +4,7 @@
 %%
 %% Copyright (c) 2007-2024 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 
--module('Elixir.RabbitMQ.CLI.Ctl.Commands.ListWebMqttConnectionsCommand').
+-module('Elixir.RabbitMQ.CLI.Ctl.Commands.ListWebOcppConnectionsCommand').
 
 -include_lib("rabbit_web_ocpp.hrl").
 
@@ -30,7 +30,7 @@ scopes() -> [ctl, diagnostics].
 switches() -> [{verbose, boolean}].
 aliases() -> [{'V', verbose}].
 
-description() -> <<"Lists all Web MQTT connections">>.
+description() -> <<"Lists all Web OCPP connections">>.
 
 help_section() ->
     {plugin, web_ocpp}.
