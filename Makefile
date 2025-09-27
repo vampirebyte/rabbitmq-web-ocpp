@@ -26,9 +26,5 @@ BUILD_DEPS += ranch
 DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-plugin.mk
 DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
 
-# The monorepo structure of RabbitMQ does not work for OOT plugins.
-DEPS_DIR ?= $(abspath ../rabbitmq-server/deps)
-ERLANG_MK_TMP ?= $(abspath ./.erlang.mk)
-
-include ../rabbitmq-server/rabbitmq-components.mk
-include ../rabbitmq-server/erlang.mk
+include ../../rabbitmq-components.mk
+include ../../erlang.mk
