@@ -1,0 +1,38 @@
+name: build
+on: [push, pull_request]
+env:
+  SERVER_FOLDER: rabbitmq-server
+  PLUGIN_FOLDER: rabbitmq-server/deps/rabbitmq_web_ocpp
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        PLATFORM:
+          - { RMQREF: "v4.0.x", ERLVER: "26.2" }
+          - { RMQREF: "v4.1.x", ERLVER: "27" }
+    name: "Broker: ${{ matrix.PLATFORM.RMQREF }} - Erlang: ${{ matrix.PLATFORM.ERLVER }}"
+    steps:
+      - name: Checkout RabbitMQ Server
+        uses: actions/checkout@v4
+        with:
+          repository: rabbitmq/rabbitmq-server
+          path: ${{ env.SERVER_FOLDER }}
+      - name: Checkout Plugin
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.PLUGIN_FOLDER }}
+      - name: Install Erlang and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.PLATFORM.ERLVER }}
+      - name: Build distribution files
+        working-directory: ${{ env.PLUGIN_FOLDER }}
+        run: |
+          make dist RABBITMQ_VERSION=${{ matrix.PLATFORM.RMQREF }} MIX_ENV=prod DIST_AS_EZS=yes
+      - name: Store build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugins-ocpp-rmq${{ matrix.PLATFORM.RMQREF }}-erl${{ matrix.PLATFORM.ERLVER }}
+          path: |
+            ${{ env.PLUGIN_FOLDER }}/plugins/rabbitmq_web_ocpp-[0-9].*.ez
