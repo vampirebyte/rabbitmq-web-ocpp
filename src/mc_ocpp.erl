@@ -11,6 +11,7 @@
     init/1,
     size/1,
     x_header/2,
+    x_headers/1,
     property/2,
     routing_headers/2,
     convert_from/3,
@@ -51,8 +52,17 @@ size(#ocpp_msg{payload = Iol}) ->
     {0, iolist_size(Iol)}.
 
 %%--------------------------------------------------------------------
+
+%% retrieve an x- header from the protocol data
+%% the return value should be tagged with an AMQP 1.0 type
 x_header(_Key, #ocpp_msg{}) ->
     undefined.
+
+%% retrieve x- headers from the protocol data
+%% the return values should be tagged with an AMQP 1.0 type
+-spec x_headers(#ocpp_msg{}) -> [{binary(), term()}].
+x_headers(#ocpp_msg{}) ->
+    [].
 
 %%--------------------------------------------------------------------
 property(correlation_id, #ocpp_msg{msg_id = ID}) when is_binary(ID) ->
