@@ -6,6 +6,9 @@
 %%
 
 -module(rabbit_web_ocpp_handler).
+
+-feature(maybe_expr, enable).
+
 -behaviour(cowboy_websocket).
 -behaviour(cowboy_sub_protocol).
 

@@ -6,7 +6,8 @@
 %%
 -module(rabbit_web_ocpp_processor).
 
-%% Simplified exports for OCPP
+-feature(maybe_expr, enable).
+
 -export([info/2,
          init/7,
          process_incoming/2,

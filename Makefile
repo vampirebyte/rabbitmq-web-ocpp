@@ -28,3 +28,7 @@ DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
 
 include ../../rabbitmq-components.mk
 include ../../erlang.mk
+
+# compile: warnings being treated as errors
+# Elixir.RabbitMQ.CLI.Ctl.Commands.ListWebOcppConnectionsCommand.erl:11:2: behaviour 'Elixir.RabbitMQ.CLI.CommandBehaviour' undefined
+ERLC_OPTS := $(filter-out -Werror,$(ERLC_OPTS))
