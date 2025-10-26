@@ -29,8 +29,6 @@
          upgrade/5,
          takeover/7]).
 
--define(APP, rabbitmq_web_ocpp).
-
 -ifdef(TEST).
 -define(SILENT_CLOSE_DELAY, 10).
 -else.
@@ -74,70 +72,47 @@ init(Req, Opts) ->
     %% Retrieve the vhost and client_id from URL path first
     Vhost = cowboy_req:binding(vhost, Req),
     ClientId = cowboy_req:binding(client_id, Req),
+    {PeerIp, _PeerPort} = cowboy_req:peer(Req),
 
     case {Vhost, ClientId} of
         {<<>>, _} ->
             {ok, cowboy_req:reply(404, #{}, <<"Vhost not specified">>, Req), #state{}};
         {_, <<>>} ->
             {ok, cowboy_req:reply(404, #{}, <<"Client ID not specified">>, Req), #state{}};
-        {V1, CId} when V1 =:= <<>> orelse CId =:= <<>> ->
-            {ok, cowboy_req:reply(404, #{}, <<"Invalid Vhost or Client ID">>, Req), #state{}};
-        {V2, CId} ->
-            %% ClientId is valid, now check subprotocol
-            case cowboy_req:parse_header(<<"sec-websocket-protocol">>, Req) of
-                undefined ->
-                    no_supported_sub_protocol(undefined, ClientId, Req);
-                ProtocolList ->
-                    %% Map protocols to their atom representations, filtering out unsupported ones
-                    SupportedProtos = [{Proto, ?OCPP_PROTO_TO_ATOM(Proto)} || 
-                                       Proto <- ProtocolList, 
-                                       ?OCPP_PROTO_TO_ATOM(Proto) =/= undefined],
-
-                    case SupportedProtos of
-                        [] ->
-                            no_supported_sub_protocol(ProtocolList, ClientId, Req);
-                        [{MatchingProtocol, ProtocolVer}|_] ->
-                            %% First supported protocol is selected (preserving client preference order)
-                            Req1 = cowboy_req:set_resp_header(<<"sec-websocket-protocol">>, 
-                                                             MatchingProtocol, Req),
-                            AuthHd = cowboy_req:header(<<"authorization">>, Req, <<>>),
-                            case AuthHd of
-                                <<>> ->
-                                    %% No Authorization header, request credentials
-                                    Headers = #{<<"www-authenticate">> => <<"Basic realm=\"RabbitMQ\"">>},
-                                    {ok, cowboy_req:reply(401, Headers, <<"Unauthorized">>, Req), #state{}};
-                                _ ->
-                                    case cow_http_hd:parse_authorization(AuthHd) of
-                                        {basic, Username, Password} ->
-                                            %% Perform authentication check here
-                                            case rabbit_access_control:check_user_login(
-                                                    Username, [{password, Password}]) of
-                                                {ok, User} ->
-                                                    State0 = #state{socket = maps:get(proxy_header, Req, undefined),
-                                                                proto_ver = ProtocolVer,
-                                                                vhost = V2,
-                                                                user = User,
-                                                                client_id = CId},
-                                                    WsOpts0 = proplists:get_value(ws_opts, Opts, #{}),
-                                                    IdleTimeoutMs = maps:get(idle_timeout, WsOpts0, ?DEFAULT_IDLE_TIMEOUT_MS),
-                                                    WsOpts = maps:merge(#{compress => true, idle_timeout => IdleTimeoutMs}, WsOpts0),
-                                                    IdleTimeoutS = case IdleTimeoutMs of
-                                                                    infinity -> 0;
-                                                                    Ms -> Ms div 1000
-                                                                   end,
-                                                    State = State0#state{idle_timeout = IdleTimeoutS},
-                                                    {?MODULE, Req1, State, WsOpts};
-                                                {error, _Reason} ->
-                                                    Headers = #{<<"www-authenticate">> => <<"Basic realm=\"RabbitMQ\"">>},
-                                                    {ok, cowboy_req:reply(401, Headers, <<"Unauthorized">>, Req), #state{}}
-                                            end;
-                                        _ ->
-                                            %% Invalid Authorization header format
-                                            Headers = #{<<"www-authenticate">> => <<"Basic realm=\"RabbitMQ\"">>},
-                                            {ok, cowboy_req:reply(401, Headers, <<"Unauthorized">>, Req), #state{}}
-                                    end
-                            end
-                    end
+        _ ->
+            {Username0, Password0} = basic_auth_creds(Req),
+            SslLoginName = none,
+            Result = maybe
+                ok ?= check_vhost_exists(Vhost, ClientId, PeerIp),
+                ok ?= check_vhost_alive(Vhost),
+                {ProtoVer, Req1} ?= pick_protocol(Req, ClientId),
+                {ok, Username1, Password1} ?= check_credentials(Username0, Password0, SslLoginName, PeerIp),
+                {ok, User0} ?= check_user_login(Vhost, Username1, Password1, ClientId, PeerIp),
+                AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>},
+                ok ?= check_vhost_access(Vhost, User0, ClientId, PeerIp, AuthzCtx),
+                {ok, Req1, Vhost, ClientId, User0, ProtoVer}
+            end,
+            case Result of
+                {ok, Req2, V2, CId, User, ProtocolVer} ->
+                    ProxyInfo   = maps:get(proxy_header, Req2, undefined),
+                    WsOpts0     = proplists:get_value(ws_opts, Opts, #{}),
+                    IdleMs      = maps:get(idle_timeout, WsOpts0, ?DEFAULT_IDLE_TIMEOUT_MS),
+                    WsOpts      = maps:merge(#{compress => true, idle_timeout => IdleMs}, WsOpts0),
+                    IdleSec     = case IdleMs of infinity -> 0; Ms -> Ms div 1000 end,
+                    State = #state{socket = ProxyInfo, proto_ver = ProtocolVer, vhost = V2,
+                                   user = User, client_id = CId, idle_timeout = IdleSec},
+                    {?MODULE, Req2, State, WsOpts};
+                {error, bad_vhost} ->
+                    {ok, cowboy_req:reply(404, #{}, <<"Invalid Vhost">>, Req), #state{}};
+                {error, vhost_down} ->
+                    {ok, cowboy_req:reply(503, #{}, <<"Vhost is down">>, Req), #state{}};
+                {error, invalid_subprotocol} ->
+                    {ok, cowboy_req:reply(400, #{<<"connection">> => <<"close">>},
+                                          <<"Unsupported or missing OCPP subprotocol">>, Req), #state{}};
+                {error, _} ->
+                    {ok, cowboy_req:reply(401,
+                          #{<<"www-authenticate">> => <<"Basic realm=\"OCPP\"">>},
+                          <<"Unauthorized">>, Req), #state{}}
             end
     end.
 
@@ -156,8 +131,8 @@ info(Pid, Items) ->
     Res.
 -spec websocket_init(state()) ->
     {cowboy_websocket:commands(), state()} |
-    {cowboy_websocket:commands(), state(), hibernate}.
-websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = ClientId, proto_ver = ProtoVer}) ->
+    {cowboy_websocket:commands(), state, hibernate}.
+websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = ClientId, user = User, proto_ver = ProtoVer}) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_CONN ++ [web_ocpp]}),
     case rabbit_net:connection_string(Socket, inbound) of
         {ok, ConnStr} ->
@@ -166,8 +141,9 @@ websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = Clien
             State1 = State0#state{conn_name = ConnName},
             State2 = rabbit_event:init_stats_timer(State1, #state.stats_timer),
             % Inside `init` of the processor "connection_created" is called for management UI to show the connection
-            case rabbit_web_ocpp_processor:init(Vhost, ClientId, ProtoVer, rabbit_net:unwrap_socket(Socket),
-                                                    ConnName, fun send_reply/1) of
+            case rabbit_web_ocpp_processor:init(Vhost, ClientId, ProtoVer,
+                                                rabbit_net:unwrap_socket(Socket),
+                                                ConnName, User, fun send_reply/1) of
                 {ok, ProcState} ->
                     ?LOG_INFO("Accepted Web OCPP connection ~ts for client ID ~ts",
                                 [ConnName, ClientId]),
@@ -321,7 +297,7 @@ websocket_info(Msg, State) ->
     {[], State, hibernate}.
 
 terminate(Reason, _Request, #state{conn_name = ConnName,
-                            proc_state = PState, % Can be undefined if init failed
+                            proc_state = PState, % Can be undefined if init crashed
                             client_id = ClientId} = State) ->
     ?LOG_INFO("Web OCPP closing connection ~ts for client ID ~p", [ConnName, ClientId]),
     maybe_emit_stats(State),
@@ -331,7 +307,12 @@ terminate(Reason, _Request, #state{conn_name = ConnName,
         _ ->
             Infos = infos(?EVENT_KEYS, State),
             rabbit_web_ocpp_processor:terminate(Reason, Infos, PState)
-    end.
+    end;
+
+terminate(Reason, _Request, Opts) ->
+    %% Fallback clause when init crashed before state record was established
+    ?LOG_INFO("Web OCPP closing connection. Reason: ~p Opts: ~p", [Reason, Opts]),
+    ok.
 
 %% Internal.
 
@@ -346,6 +327,35 @@ ssl_login_name(Sock) ->
                                 end;
         {error, no_peercert} -> none;
         nossl                -> none
+    end.
+
+pick_protocol(Req, ClientId) ->
+    %% The client MUST include a valid ocpp version in the list of
+    %% WebSocket Sub Protocols it offers [OCPP 1.6 JSON spec §3.1.2].
+    case cowboy_req:parse_header(<<"sec-websocket-protocol">>, Req) of
+        undefined ->
+            ?LOG_ERROR("Web OCPP: missing subprotocol list for client ~p", [ClientId]),
+            {error, invalid_subprotocol};
+        ProtoList ->
+            case [ {P, ?OCPP_PROTO_TO_ATOM(P)} || P <- ProtoList,
+                                             ?OCPP_PROTO_TO_ATOM(P) =/= undefined ] of
+                [] ->
+                    ?LOG_ERROR("Web OCPP: no supported ocppX.X subprotocol in ~p for client ~p",
+                               [ProtoList, ClientId]),
+                    {error, invalid_subprotocol};
+                [{Matched, Ver}|_] ->
+                    {Ver, cowboy_req:set_resp_header(<<"sec-websocket-protocol">>, Matched, Req)}
+            end
+    end.
+
+basic_auth_creds(Req) ->
+    case cowboy_req:header(<<"authorization">>, Req, <<>>) of
+        <<>> -> {undefined, undefined};
+        H ->
+            case cow_http_hd:parse_authorization(H) of
+                {basic, U, P} -> {U, P};
+                _ -> {undefined, undefined}
+            end
     end.
 
 check_credentials(Username, Password, SslLoginName, PeerIp) ->
@@ -369,7 +379,7 @@ check_credentials(Username, Password, SslLoginName, PeerIp) ->
 creds(User, Pass, SSLLoginName) ->
     CredentialsProvided = User =/= undefined orelse Pass =/= undefined,
     ValidCredentials = is_binary(User) andalso is_binary(Pass) andalso Pass =/= <<>>,
-    {ok, TLSAuth} = application:get_env(?APP_NAME, ssl_cert_login),
+    TLSAuth = application:get_env(?APP_NAME, ssl_cert_login, false),
     SSLLoginProvided = TLSAuth =:= true andalso SSLLoginName =/= none,
 
     case {CredentialsProvided, ValidCredentials, SSLLoginProvided} of
@@ -380,11 +390,11 @@ creds(User, Pass, SSLLoginName) ->
             %% Either username or password is provided
             {invalid_creds, {User, Pass}};
         {false, false, true} ->
-            %% rabbitmq_mqtt.ssl_cert_login is true. SSL user name provided.
+            %% rabbitmq_web_ocpp.ssl_cert_login is true. SSL user name provided.
             %% Authenticating using username only.
             {ok, SSLLoginName, none};
         {false, false, false} ->
-            {ok, AllowAnon} = application:get_env(?APP_NAME, allow_anonymous),
+            AllowAnon = application:get_env(?APP_NAME, allow_anonymous, false),
             case AllowAnon of
                 true ->
                     case rabbit_auth_mechanism_anonymous:credentials() of
@@ -400,18 +410,56 @@ creds(User, Pass, SSLLoginName) ->
             nocreds
     end.
 
+check_vhost_exists(Vhost, UsernameForLog, PeerIp) ->
+    case rabbit_vhost:exists(Vhost) of
+        true -> ok;
+        false ->
+            ?LOG_ERROR("OCPP connection failed: vhost '~s' does not exist", [Vhost]),
+            auth_attempt_failed(PeerIp, UsernameForLog),
+            {error, bad_vhost}
+    end.
+
+check_vhost_alive(Vhost) ->
+     case rabbit_vhost_sup_sup:is_vhost_alive(Vhost) of
+        true -> ok;
+        false ->
+            ?LOG_ERROR("OCPP connection failed: vhost '~s' is down", [Vhost]),
+            {error, vhost_down}
+    end.
+
+check_vhost_access(Vhost, User, _ClientId, PeerIp, AuthzCtx) ->
+    try rabbit_access_control:check_vhost_access(User, Vhost, {ip, PeerIp}, AuthzCtx) of
+        ok -> ok
+    catch exit:#amqp_error{name = not_allowed, explanation = Msg} ->
+        ?LOG_ERROR("OCPP vhost access refused for user '~s' to vhost '~s': ~s",
+                   [User#user.username, Vhost, Msg]),
+        auth_attempt_failed(PeerIp, User#user.username),
+        {error, access_refused}
+    end.
+
+check_user_login(Vhost, Username, Password, ClientId, PeerIp) ->
+    %% For OCPP, Password might be 'none' if using cert auth or no auth
+    EffectivePassword = case Password of none -> <<>> ; _ -> Password end,
+    AuthProps = [{vhost, Vhost}, {client_id, ClientId}, {password, EffectivePassword}],
+    case rabbit_access_control:check_user_login(Username, AuthProps) of
+        {ok, User = #user{username = RabbitUser}} ->
+            notify_auth_result(user_authentication_success, RabbitUser, PeerIp),
+            {ok, User};
+        {refused, UserForLog, Msg, Args} ->
+            ?LOG_ERROR("OCPP login failed for user '~s': " ++ Msg, [UserForLog | Args]),
+            notify_auth_result(user_authentication_failure, UserForLog, PeerIp),
+            auth_attempt_failed(PeerIp, UserForLog),
+            {error, authentication_failure}
+    end.
+
+notify_auth_result(Event, Username, PeerIp) ->
+    rabbit_event:notify(Event, [{name, Username}, {peer_id, PeerIp},
+                                {connection_type, network}, {protocol, ocpp}]).
+
 -spec auth_attempt_failed(inet:ip_address(), binary()) -> ok.
 auth_attempt_failed(PeerIp, Username) ->
     rabbit_core_metrics:auth_attempt_failed(PeerIp, Username, ocpp),
     timer:sleep(?SILENT_CLOSE_DELAY).
-
-no_supported_sub_protocol(Protocol, ClientId, Req) ->
-    %% The client MUST include a valid ocpp version in the list of
-    %% WebSocket Sub Protocols it offers [OCPP 1.6 JSON spec §3.1.2].
-    ?LOG_ERROR("Web OCPP: Invalid 'ocppX.X' version included in client (~p) offered subprotocols: ~tp", [ClientId, Protocol]),
-    {ok,
-     cowboy_req:reply(400, #{<<"connection">> => <<"close">>}, Req),
-     #state{}}.
 
 %% Allow DISCONNECT packet to be sent to client before closing the connection.
 defer_close(CloseStatusCode) ->
