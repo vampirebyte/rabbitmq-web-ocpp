@@ -1,0 +1,40 @@
+name: build
+on: [push, pull_request]
+env:
+  SERVER_FOLDER: rabbitmq-server
+  PLUGIN_FOLDER: rabbitmq-server/deps/rabbitmq_web_ocpp
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        PLATFORM:
+          - { RMQREF: "4.0.9", ERLVER: "26.2", ELXVER: "1.16" }
+          - { RMQREF: "4.1.4", ERLVER: "27", ELXVER: "1.18" }
+    name: "Broker: ${{ matrix.PLATFORM.RMQREF }} - Erlang: ${{ matrix.PLATFORM.ERLVER }} - Elixir: ${{ matrix.PLATFORM.ELXVER }}"
+    steps:
+      - name: Checkout RabbitMQ Server
+        uses: actions/checkout@v4
+        with:
+          repository: rabbitmq/rabbitmq-server
+          ref: v${{ matrix.PLATFORM.RMQREF }}
+          path: ${{ env.SERVER_FOLDER }}
+      - name: Checkout Plugin
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.PLUGIN_FOLDER }}
+      - name: Install Erlang and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.PLATFORM.ERLVER }}
+          elixir-version: ${{ matrix.PLATFORM.ELXVER }}
+      - name: Build distribution files
+        working-directory: ${{ env.PLUGIN_FOLDER }}
+        run: |
+          make dist RABBITMQ_VERSION=${{ matrix.PLATFORM.RMQREF }} MIX_ENV=prod DIST_AS_EZS=yes IS_DEP=true
+      - name: Store build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugins-ocpp-rmq${{ matrix.PLATFORM.RMQREF }}-erl${{ matrix.PLATFORM.ERLVER }}-elx${{ matrix.PLATFORM.ELXVER }}
+          path: |
+            ${{ env.PLUGIN_FOLDER }}/plugins/rabbitmq_web_ocpp-[0-9].*.ez
