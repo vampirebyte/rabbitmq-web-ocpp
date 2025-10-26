@@ -34,6 +34,7 @@
 
 -spec start(_, _) -> {ok, pid()}.
 start(_Type, _StartArgs) ->
+    init_global_counters(),
     ocpp_init(),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
@@ -94,6 +95,21 @@ emit_connection_info(Items, Ref, AggregatorPid, Pids) ->
 %%
 %% Implementation
 %%
+
+init_global_counters() ->
+    lists:foreach(fun init_global_counters/1, [?OCPP_PROTO_V12,
+                                               ?OCPP_PROTO_V15,
+                                               ?OCPP_PROTO_V16,
+                                               ?OCPP_PROTO_V20,
+                                               ?OCPP_PROTO_V201,
+                                               ?OCPP_PROTO_V21]).
+
+init_global_counters(ProtoVer) ->
+    Proto = {protocol, ProtoVer},
+    rabbit_global_counters:init([Proto]),
+    rabbit_global_counters:init([Proto, {queue_type, rabbit_classic_queue}]),
+    rabbit_global_counters:init([Proto, {queue_type, rabbit_quorum_queue}]),
+    rabbit_global_counters:init([Proto, {queue_type, rabbit_stream_queue}]).
 
 ocpp_init() ->
     CowboyOpts0  = maps:from_list(get_env(cowboy_opts, [])),

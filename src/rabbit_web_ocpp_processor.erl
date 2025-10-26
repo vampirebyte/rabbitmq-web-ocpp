@@ -8,7 +8,7 @@
 
 %% Simplified exports for OCPP
 -export([info/2,
-         init/6,
+         init/7,
          process_incoming/2,
          terminate/3,
          handle_info/2,
@@ -83,20 +83,21 @@
            ProtoVer :: ocpp_protocol_version_atom(),
            RawSocket :: rabbit_net:socket(),
            ConnectionName :: binary(),
+           User :: #user{},
            SendFun :: send_fun()) ->
     {ok, state()} | {error, term()}.
-init(Vhost, ClientId, ProtoVer, Socket, ConnName0, SendFun) ->
+init(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun) ->
     %% Check whether peer closed the connection.
     %% For example, this can happen when connection was blocked because of resource
     %% alarm and client therefore disconnected.
     case rabbit_net:socket_ends(Socket, inbound) of
         {ok, SocketEnds} ->
-            process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, SendFun, SocketEnds);
+            process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, SocketEnds);
         {error, Reason} ->
             {error, {socket_ends, Reason}}
     end.
 
-process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, SendFun, {PeerIp, PeerPort, Ip, Port}) ->
+process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {PeerIp, PeerPort, Ip, Port}) ->
     ?LOG_DEBUG("OCPP init request. ClientId: ~ts, ConnName: ~ts", [ClientId, ConnName0]),
 
     case rabbit_net:socket_ends(Socket, inbound) of
@@ -109,14 +110,8 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, SendFun, {PeerIp, 
     %% 2. Authentication & Authorization
     Result =
         maybe
-            ok ?= check_vhost_exists(Vhost, ClientId, PeerIp),
-            ok ?= check_vhost_alive(Vhost),
-            % Use ClientId as username for RabbitMQ auth
-            {ok, User = #user{username = _RabbitUser}} ?= check_user_login(Vhost, ClientId, <<"guest">>,
-                                                                           ClientId, PeerIp, ConnName0),
             % Authz context might include ClientId specific info if needed by backends
             AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>},
-            ok ?= check_vhost_access(Vhost, User, ClientId, PeerIp, AuthzCtx),
             ok = register_client_id(Vhost, ClientId),
             % Register potentially (optional, depends if needed for mgmt/tracking)
             ok = rabbit_networking:register_non_amqp_connection(self()),
@@ -609,57 +604,6 @@ queue_name(Vhost, ClientId) ->
     rabbit_misc:r(Vhost, queue, QNameBin).
 %% --- Permission Checks (Simplified wrappers around MQTT versions) ---
 
-check_vhost_exists(Vhost, UsernameForLog, PeerIp) ->
-    case rabbit_vhost:exists(Vhost) of
-        true -> ok;
-        false ->
-            ?LOG_ERROR("OCPP connection failed: vhost '~s' does not exist", [Vhost]),
-            auth_attempt_failed(PeerIp, UsernameForLog),
-            {error, bad_vhost}
-    end.
-
-check_vhost_alive(Vhost) ->
-     case rabbit_vhost_sup_sup:is_vhost_alive(Vhost) of
-        true -> ok;
-        false ->
-            ?LOG_ERROR("OCPP connection failed: vhost '~s' is down", [Vhost]),
-            {error, vhost_down}
-    end.
-
-check_user_login(Vhost, Username, Password, ClientId, PeerIp, ConnName) ->
-    %% For OCPP, Password might be 'none' if using cert auth or no auth
-    EffectivePassword = case Password of none -> <<>> ; _ -> Password end,
-    AuthProps = [{vhost, Vhost}, {client_id, ClientId}, {password, EffectivePassword}],
-    case rabbit_access_control:check_user_login(Username, AuthProps) of
-        {ok, User = #user{username = RabbitUser}} ->
-            notify_auth_result(user_authentication_success, RabbitUser, ConnName),
-            {ok, User};
-        {refused, UserForLog, Msg, Args} ->
-            ?LOG_ERROR("OCPP login failed for user '~s': " ++ Msg, [UserForLog | Args]),
-            notify_auth_result(user_authentication_failure, UserForLog, ConnName),
-            auth_attempt_failed(PeerIp, UserForLog),
-            {error, authentication_failure}
-    end.
-
-check_vhost_access(Vhost, User, _ClientId, PeerIp, AuthzCtx) ->
-    try rabbit_access_control:check_vhost_access(User, Vhost, {ip, PeerIp}, AuthzCtx) of
-        ok -> ok
-    catch exit:#amqp_error{name = not_allowed, explanation = Msg} ->
-        ?LOG_ERROR("OCPP vhost access refused for user '~s' to vhost '~s': ~s",
-                   [User#user.username, Vhost, Msg]),
-        auth_attempt_failed(PeerIp, User#user.username),
-        {error, access_refused}
-    end.
-
-notify_auth_result(Event, Username, ConnName) ->
-    rabbit_event:notify(Event, [{name, Username}, {connection_name, ConnName},
-                                {connection_type, network}, {protocol, ocpp}]).
-
-auth_attempt_failed(PeerIp, Username) ->
-    rabbit_core_metrics:auth_attempt_failed(PeerIp, Username, ocpp).
-    %% No artificial delay needed like in MQTT? Depends on security policy.
-    % timer:sleep(?SILENT_CLOSE_DELAY).
-
 %% Check permissions for publishing to the OCPP exchange
 check_publish_permitted(Exchange, CPID, State = #state{auth_state = AuthState}) ->
     case check_resource_access(AuthState#auth_state.user, Exchange, write, AuthState#auth_state.authz_ctx) of
@@ -884,7 +828,8 @@ maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"StatusNotif
             %% Construct the key and value for user_prop
             ConnectorIdBin = erlang:integer_to_binary(ConnectorId),
             Key = <<"statusConnectorId", ConnectorIdBin/binary>>,
-            Value = <<Status/binary, " (", ErrorCode/binary, ")">>,
+            %% Store a nested object with status and errorCode
+            Value = [{<<"status">>, Status}, {<<"errorCode">>, ErrorCode}],
             UpdatedProps = lists:keystore(Key, 1, OldProps, {Key, longstr, Value}),
             %% Update state and refresh stats
             UpdatedState = State#state{cfg = Cfg#cfg{user_prop = UpdatedProps}},
@@ -926,7 +871,7 @@ info(channel_max, _) -> 0;
 info(node, _) -> node();
 info(frame_max, _) -> 0; % Not applicable like MQTT
 %% SASL not supported?
-info(auth_mechanism, _) -> <<"blabla">>;
+info(auth_mechanism, _) -> <<"BASIC">>;
 info(recv_oct, _) -> erlang:process_info(self(), message_queue_len); % Approx incoming? Needs better metric
 info(send_oct, _) -> 0; % Hard to track accurately here
 info(Other, #state{cfg=#cfg{client_id=ClientId}}) ->
