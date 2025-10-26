@@ -31,6 +31,57 @@ jobs:
       - name: Build distribution files
         working-directory: ${{ env.PLUGIN_FOLDER }}
         run: |
+          echo "=== Current working directory ==="
+          pwd
+          ls -al
+          
+          echo "=== Git status and branch info ==="
+          git status
+          git branch -a
+          git log --oneline -5
+          
+          echo "=== Current commit details ==="
+          git log -1 --stat
+          git show --name-only HEAD
+          
+          echo "=== File timestamps ==="
+          stat src/rabbit_web_ocpp_handler.erl
+          stat src/rabbit_web_ocpp_processor.erl
+          
+          echo "=== Checking for syntax issues around line 86 in handler ==="
+          sed -n '80,90p' src/rabbit_web_ocpp_handler.erl
+          
+          echo "=== Full handler file (first 100 lines) ==="
+          head -100 src/rabbit_web_ocpp_handler.erl
+          
+          echo "=== Full processor file (first 50 lines) ==="
+          head -50 src/rabbit_web_ocpp_processor.erl
+          
+          echo "=== File hashes ==="
+          echo "Handler file hash:"
+          sha256sum src/rabbit_web_ocpp_handler.erl
+          echo "Processor file hash:"
+          sha256sum src/rabbit_web_ocpp_processor.erl
+          echo "All source files hashes:"
+          sha256sum src/*.erl
+          
+          echo "=== Line counts ==="
+          wc -l src/rabbit_web_ocpp_handler.erl
+          wc -l src/rabbit_web_ocpp_processor.erl
+          
+          echo "=== Searching for problematic patterns ==="
+          echo "Looking for 'maybe' expressions in handler:"
+          grep -n "maybe" src/rabbit_web_ocpp_handler.erl || echo "No 'maybe' found"
+          echo "Looking for '?=' operators in handler:"
+          grep -n "?=" src/rabbit_web_ocpp_handler.erl || echo "No '?=' found"
+          
+          echo "=== Erlang version ==="
+          erl -eval 'io:format("~s~n", [erlang:system_info(system_version)]), halt().' -noshell
+          
+          echo "=== Make clean first ==="
+          make clean || true
+          
+          echo "=== Starting build with verbose compilation ==="
           make dist RABBITMQ_VERSION=${{ matrix.PLATFORM.RMQREF }} MIX_ENV=prod DIST_AS_EZS=yes IS_DEP=true
       - name: Store build artifacts
         uses: actions/upload-artifact@v4
