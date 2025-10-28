@@ -178,15 +178,20 @@ process_incoming(McOcpp = #ocpp_msg{},
             %% 2. Validate Exchange
             case rabbit_exchange:lookup(ExchangeName) of
                 {ok, Exchange} ->
-                    %% 3. Prepare annotations and initialize Message Container (mc) with mc_ocpp type
-                    Anns = #{?ANN_EXCHANGE => ?DEFAULT_EXCHANGE_NAME},
+                    %% 3. Generate structured routing key (protocolver.actionname.req/conf)
+                    RoutingKey = generate_routing_key(McOcpp, State),
+                    
+                    %% 4. Prepare annotations and initialize Message Container (mc) with mc_ocpp type
+                    Anns = #{?ANN_EXCHANGE => ?DEFAULT_EXCHANGE_NAME,
+                             ?ANN_ROUTING_KEYS => [RoutingKey]},
                     case mc:init(mc_ocpp, McOcpp, Anns, #{}) of
                         McMsg ->
-                            ?LOG_DEBUG("Created message container for ClientId ~ts: ~tp", [ClientId, McMsg]),
-                            %% 4. Trace (optional)
+                            ?LOG_DEBUG("Created message container for ClientId ~ts with routing key ~ts: ~tp", 
+                                      [ClientId, RoutingKey, McMsg]),
+                            %% 5. Trace (optional)
                             rabbit_trace:tap_in(McMsg, [ExchangeName], ConnName, User#user.username, TraceState),
 
-                            %% 5. Publish to the exchange with the ClientId as routing key
+                            %% 6. Publish to the exchange with the structured routing key
                             case rabbit_exchange:route(Exchange, McMsg, #{}) of
                                 ok ->
                                     ?LOG_INFO("Message routed successfully for ClientId ~ts", [ClientId]),
@@ -383,6 +388,34 @@ terminate(Reason, Infos, _State = #state{queue_states = QStates,
 
 %% --- Internal Functions ---
 
+%% @doc Generates a structured routing key in the format: ocpp.protocolver.actionname.req/conf
+%% Examples: "ocpp.ocpp16.BootNotification.req", "ocpp.ocpp20.Heartbeat.conf", "ocpp.ocpp201.StatusNotification.req"
+-spec generate_routing_key(#ocpp_msg{}, state()) -> binary().
+generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action}, 
+                     #state{cfg = #cfg{proto_ver = ProtoVer}}) ->
+    %% Convert protocol version atom to binary string
+    ProtoVerBin = atom_to_binary(ProtoVer, utf8),
+
+    %% Handle action name (may be undefined for responses)
+    ActionBin = case Action of
+        undefined -> <<"response">>;  % For CALLRESULT/CALLERROR without action
+        ActionName when is_binary(ActionName) -> ActionName;
+        _ -> <<"unknown">>
+    end,
+    
+    %% Determine message direction (req/conf/error)
+    MsgTypeBin = case MsgType of
+        ?OCPP_MESSAGE_TYPE_CALL -> <<"req">>;      % Request from charge point
+        ?OCPP_MESSAGE_TYPE_SEND -> <<"req">>;      % Request in OCPP 2.1
+        ?OCPP_MESSAGE_TYPE_CALLRESULT -> <<"conf">>; % Response/confirmation
+        ?OCPP_MESSAGE_TYPE_CALLERROR -> <<"error">>; % Error response
+        ?OCPP_MESSAGE_TYPE_CALLRESULTERROR -> <<"error">>; % Error in OCPP 2.1
+        _ -> <<"unknown">>
+    end,
+    
+    %% Construct routing key: ocpp.protocolver.actionname.req|conf|error
+    <<ProtoVerBin/binary, ".", ActionBin/binary, ".", MsgTypeBin/binary>>.
+
 %% @doc Extracts relevant metadata from a parsed OCPP message list.
 % -spec extract_ocpp_metadata(list()) -> {ok, MsgId :: binary(), Action :: binary() | undefined} | {error, term()}.
 % extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_CALL, MsgId, Action, _Payload]) when is_binary(MsgId), is_binary(Action) -> {ok, MsgId, Action};
@@ -552,7 +585,7 @@ consume_from_queue(State = #state{cfg = #cfg{queue_name = QName, client_id = Cli
                      limiter_active => false,
                      mode => {simple_prefetch, Prefetch},
                      consumer_tag => ?CONSUMER_TAG,
-                     exclusive_consume => false, % Allow other consumers? (Usually false for OCPP)
+                     exclusive_consume => true, % Allow other consumers? (Usually false for OCPP)
                      args => [],
                      ok_msg => undefined,
                      acting_user => User#user.username},

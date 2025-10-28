@@ -35,6 +35,7 @@ RabbitMQ already excels at message durability and routing, but traditionally the
 ## Installation
 
 This plugin works only with modern versions of RabbitMQ 4.x based on AMQP 1.0.
+You can [build from source](https://www.rabbitmq.com/plugin-development.html) or you can download the latest release build from GitHub. Then, unzip and place the `rabbitmq_web_ocpp-4.x.x.ez` file into your `/etc/rabbitmq/plugins/` folder.
 Like all plugins, it [must be enabled](https://www.rabbitmq.com/plugins.html) before it can be used:
 
 ``` bash
@@ -42,18 +43,14 @@ Like all plugins, it [must be enabled](https://www.rabbitmq.com/plugins.html) be
 rabbitmq-plugins enable rabbitmq_web_ocpp
 ```
 
+Detailed instructions on how to install a plugin into RabbitMQ broker can be found [here](https://www.rabbitmq.com/plugins.html#installing-plugins).
+
+Note that release branches (`v4.1.x` vs. `main`) and target RabbitMQ version need to be taken into account
+when building plugins from source.
+
 ## Documentation
 
 For all configuration options, please refer to the nearly identical plugin, [RabbitMQ Web MQTT guide](https://www.rabbitmq.com/web-mqtt.html).
-
-
-## Building From Source
-
- * [Generic plugin build instructions](https://www.rabbitmq.com/plugin-development.html)
- * Instructions on [how to install a plugin into RabbitMQ broker](https://www.rabbitmq.com/plugins.html#installing-plugins)
-
-Note that release branches (`stable` vs. `master`) and target RabbitMQ version need to be taken into account
-when building plugins from source.
 
 ## Enterprise-Grade Hosting & SLA Support
 
