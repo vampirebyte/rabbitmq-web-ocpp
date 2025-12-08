@@ -35,7 +35,7 @@ RabbitMQ already excels at message durability and routing, but traditionally the
 ## Installation
 
 This plugin works only with modern versions of RabbitMQ 4.x based on AMQP 1.0.
-You can [build from source](https://www.rabbitmq.com/plugin-development.html) or you can download the latest release build from GitHub. Then, unzip and place the `rabbitmq_web_ocpp-4.x.x.ez` file into your `/etc/rabbitmq/plugins/` folder.
+You can [build from source](https://www.rabbitmq.com/plugin-development.html) or you can download the latest release build from GitHub. Unzip and place the `rabbitmq_web_ocpp-4.x.x.ez` file into your `/etc/rabbitmq/plugins/` folder.
 Like all plugins, it [must be enabled](https://www.rabbitmq.com/plugins.html) before it can be used:
 
 ``` bash
@@ -48,9 +48,22 @@ Detailed instructions on how to install a plugin into RabbitMQ broker can be fou
 Note that release branches (`v4.1.x` vs. `main`) and target RabbitMQ version need to be taken into account
 when building plugins from source.
 
+## How It Works
+
+The communication flow is straightforward: 
+1. Messages arriving from the EVSE are sent to the configured exchange (default: `amq.topic`) with `correlation_id` set to the OCPP `messageId` and `reply_to` set to the EVSE ID.
+2. Configure backend worker routing on the CSMS side by creating a queue bound to the same exchange. Use routing keys in the format: `protocolver.actionname.req/conf/error`. Examples: `ocpp16.BootNotification.req`, `ocpp16.Heartbeat.conf`, `ocpp201.StatusNotification.req`. Common patterns include `ocpp16.#` for all v1.6 traffic or `*.StartTransaction.#` for billing-specific workers. See the [RabbitMQ Topics tutorial](https://www.rabbitmq.com/tutorials/tutorial-five-python#topic-exchange) for details.
+3. After processing and validating the message in your async worker, build a valid OCPP Response (or error) and publish it back to the same exchange with the routing key set to the EVSE ID and `correlation_id` set to the original request's OCPP `messageId`. The plugin handles sending this message back to the EVSE via the correct WebSocket connection.
+4. Queues can be consumed by multiple identical, stateless workers written in any programming language. Monitor queues using built-in tools (e.g., Grafana) and configure auto-scaling based on message latency or queue depth.
+5. If a worker throws an exception before sending a valid OCPP response, standard AMQP ACK/NACK principles apply: unconfirmed messages return to the queue for processing by another worker. Handle failure scenarios (e.g., database outages) gracefully to avoid infinite retry loops.
+
 ## Documentation
 
 For all configuration options, please refer to the nearly identical plugin, [RabbitMQ Web MQTT guide](https://www.rabbitmq.com/web-mqtt.html).
+
+## Screenshots
+
+![RabbitMQ Web OCPP Management Interface](examples/screenshots/Screenshot_RabbitMQ_1.png)
 
 ## Enterprise-Grade Hosting & SLA Support
 

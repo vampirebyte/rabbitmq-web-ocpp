@@ -388,8 +388,8 @@ terminate(Reason, Infos, _State = #state{queue_states = QStates,
 
 %% --- Internal Functions ---
 
-%% @doc Generates a structured routing key in the format: ocpp.protocolver.actionname.req/conf
-%% Examples: "ocpp.ocpp16.BootNotification.req", "ocpp.ocpp20.Heartbeat.conf", "ocpp.ocpp201.StatusNotification.req"
+%% @doc Generates a structured routing key in the format: protocolver.actionname.req/conf/error
+%% Examples: "ocpp16.BootNotification.req", "ocpp16.Heartbeat.conf", "ocpp201.StatusNotification.req"
 -spec generate_routing_key(#ocpp_msg{}, state()) -> binary().
 generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action}, 
                      #state{cfg = #cfg{proto_ver = ProtoVer}}) ->
