@@ -11,6 +11,7 @@ jobs:
         PLATFORM:
           - { RMQREF: "4.0.9", ERLVER: "26.2", ELXVER: "1.16" }
           - { RMQREF: "4.1.4", ERLVER: "27", ELXVER: "1.18" }
+          - { RMQREF: "4.2.4", ERLVER: "27", ELXVER: "1.19" }
     name: "Broker: ${{ matrix.PLATFORM.RMQREF }} - Erlang: ${{ matrix.PLATFORM.ERLVER }} - Elixir: ${{ matrix.PLATFORM.ELXVER }}"
     steps:
       - name: Checkout RabbitMQ Server

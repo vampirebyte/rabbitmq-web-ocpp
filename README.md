@@ -51,11 +51,12 @@ when building plugins from source.
 ## How It Works
 
 The communication flow is straightforward: 
-1. Messages arriving from the EVSE are sent to the configured exchange (default: `amq.topic`) with `correlation_id` set to the OCPP `messageId` and `reply_to` set to the EVSE ID.
-2. Configure backend worker routing on the CSMS side by creating a queue bound to the same exchange. Use routing keys in the format: `protocolver.actionname.req/conf/error`. Examples: `ocpp16.BootNotification.req`, `ocpp16.Heartbeat.conf`, `ocpp201.StatusNotification.req`. Common patterns include `ocpp16.#` for all v1.6 traffic or `*.StartTransaction.#` for billing-specific workers. See the [RabbitMQ Topics tutorial](https://www.rabbitmq.com/tutorials/tutorial-five-python#topic-exchange) for details.
-3. After processing and validating the message in your async worker, build a valid OCPP Response (or error) and publish it back to the same exchange with the routing key set to the EVSE ID and `correlation_id` set to the original request's OCPP `messageId`. The plugin handles sending this message back to the EVSE via the correct WebSocket connection.
-4. Queues can be consumed by multiple identical, stateless workers written in any programming language. Monitor queues using built-in tools (e.g., Grafana) and configure auto-scaling based on message latency or queue depth.
-5. If a worker throws an exception before sending a valid OCPP response, standard AMQP ACK/NACK principles apply: unconfirmed messages return to the queue for processing by another worker. Handle failure scenarios (e.g., database outages) gracefully to avoid infinite retry loops.
+1. Connect your EVSE to the following OCPP endpoint: `ws://127.0.0.1:19520/ocpp/%2F/` for `/` (default) vhost running on docker or adjust the URL accordingly.
+2. Messages arriving from the EVSE are sent to the configured exchange (default: `amq.topic`) with `correlation_id` set to the OCPP `messageId` and `reply_to` set to the EVSE ID.
+3. Configure backend worker routing on the CSMS side by creating a queue bound to the same exchange. Use routing keys in the format: `protocolver.actionname.req/conf/error`. Examples: `ocpp16.BootNotification.req`, `ocpp16.Heartbeat.conf`, `ocpp201.StatusNotification.req`. Common patterns include `ocpp16.#` for all v1.6 traffic or `*.StartTransaction.#` for billing-specific workers. See the [RabbitMQ Topics tutorial](https://www.rabbitmq.com/tutorials/tutorial-five-python#topic-exchange) for details.
+4. After processing and validating the message in your async worker, build a valid OCPP Response (or error) and publish it back to the same exchange with the routing key set to the EVSE ID and `correlation_id` set to the original request's OCPP `messageId`. The plugin handles sending this message back to the EVSE via the correct WebSocket connection.
+5. Queues can be consumed by multiple identical, stateless workers written in any programming language. Monitor queues using built-in tools (e.g., Grafana) and configure auto-scaling based on message latency or queue depth.
+6. If a worker throws an exception before sending a valid OCPP response, standard AMQP ACK/NACK principles apply: unconfirmed messages return to the queue for processing by another worker. Handle failure scenarios (e.g., database outages) gracefully to avoid infinite retry loops.
 
 ## Documentation
 
