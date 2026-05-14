@@ -56,7 +56,6 @@
         client_id :: binary(), % Charge Point ID
         proto_ver :: ocpp_protocol_version_atom(),
         user :: #user{}, % Authenticated user details
-        ssl_login_name :: none | binary(),
         exchange :: rabbit_exchange:name(), % Exchange to publish *to* and bind *from*
         queue_name :: rabbit_amqqueue:name(), % The single queue for this client_id
         prefetch :: non_neg_integer(),
@@ -884,7 +883,6 @@ info(port, #state{cfg = #cfg{port = Val}}) -> Val;
 info(peer_host, #state{cfg = #cfg{peer_ip_addr = Val}}) -> Val;
 info(peer_port, #state{cfg = #cfg{peer_port = Val}}) -> Val;
 info(connected_at, #state{cfg = #cfg{connected_at = Val}}) -> Val;
-info(ssl_login_name, #state{cfg = #cfg{ssl_login_name = Val}}) -> Val;
 info(user_who_performed_action, S) ->
     info(user, S);
 info(prefetch_count, #state{cfg = #cfg{prefetch = Val}}) -> Val;

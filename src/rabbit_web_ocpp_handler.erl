@@ -46,6 +46,7 @@
           vhost :: rabbit_types:vhost(),
           client_id :: client_id(),
           user :: #user{},
+          ssl_login_name = none :: none | binary(),
           conn_name :: option(binary()),
           idle_timeout :: timeout(), %% from cowboy, in seconds
           proto_ver :: ocpp_protocol_version_atom()
@@ -84,12 +85,12 @@ init(Req, Opts) ->
             {ok, cowboy_req:reply(404, #{}, <<"Client ID not specified">>, Req), #state{}};
         _ ->
             {Username0, Password0} = basic_auth_creds(Req),
-            SslLoginName = none,
+            SslLoginName = ssl_login_name_from_req(Req),
             Result = maybe
                 ok ?= check_vhost_exists(Vhost, ClientId, PeerIp),
                 ok ?= check_vhost_alive(Vhost),
                 {ProtoVer, Req1} ?= pick_protocol(Req, ClientId),
-                {ok, Username1, Password1} ?= check_credentials(Username0, Password0, SslLoginName, PeerIp),
+                {ok, Username1, Password1} ?= check_credentials(ClientId, Username0, Password0, SslLoginName, PeerIp),
                 {ok, User0} ?= check_user_login(Vhost, Username1, Password1, ClientId, PeerIp),
                 AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>},
                 ok ?= check_vhost_access(Vhost, User0, ClientId, PeerIp, AuthzCtx),
@@ -103,7 +104,8 @@ init(Req, Opts) ->
                     WsOpts      = maps:merge(#{compress => true, idle_timeout => IdleMs}, WsOpts0),
                     IdleSec     = case IdleMs of infinity -> 0; Ms -> Ms div 1000 end,
                     State = #state{socket = ProxyInfo, proto_ver = ProtocolVer, vhost = V2,
-                                   user = User, client_id = CId, idle_timeout = IdleSec},
+                                   user = User, client_id = CId, idle_timeout = IdleSec,
+                                   ssl_login_name = SslLoginName},
                     {?MODULE, Req2, State, WsOpts};
                 {error, bad_vhost} ->
                     {ok, cowboy_req:reply(404, #{}, <<"Invalid Vhost">>, Req), #state{}};
@@ -319,17 +321,17 @@ terminate(Reason, _Request, Opts) ->
 
 %% Internal.
 
--spec ssl_login_name(rabbit_net:socket()) ->
-    none | binary().
-ssl_login_name(Sock) ->
-    case rabbit_net:peercert(Sock) of
-        {ok, C}              -> case rabbit_ssl:peer_cert_auth_name(C) of
-                                    unsafe    -> none;
-                                    not_found -> none;
-                                    Name      -> Name
-                                end;
-        {error, no_peercert} -> none;
-        nossl                -> none
+%% Extract SSL login name from the Cowboy request (available before WS upgrade).
+%% Used for mutual TLS / certificate-based authentication.
+-spec ssl_login_name_from_req(cowboy_req:req()) -> none | binary().
+ssl_login_name_from_req(Req) ->
+    case cowboy_req:cert(Req) of
+        undefined -> none;
+        Cert      -> case rabbit_ssl:peer_cert_auth_name(Cert) of
+                         unsafe    -> none;
+                         not_found -> none;
+                         Name      -> Name
+                     end
     end.
 
 pick_protocol(Req, ClientId) ->
@@ -361,41 +363,47 @@ basic_auth_creds(Req) ->
             end
     end.
 
-check_credentials(Username, Password, SslLoginName, PeerIp) ->
-    case creds(Username, Password, SslLoginName) of
+check_credentials(ClientId, Username, Password, SslLoginName, PeerIp) ->
+    case creds(ClientId, Username, Password, SslLoginName) of
         {ok, _, _} = Ok ->
             Ok;
+        {invalid_cert_creds, CertLoginName} ->
+            ?LOG_ERROR("OCPP TLS client certificate identity '~s' does not match client ID '~s'",
+                       [CertLoginName, ClientId]),
+            auth_attempt_failed(PeerIp, CertLoginName),
+            {error, ?CLOSE_POLICY_VIOLATION};
         nocreds ->
-            ?LOG_ERROR("MQTT login failed: no credentials provided"),
+            ?LOG_ERROR("OCPP login failed: no credentials provided"),
             auth_attempt_failed(PeerIp, <<>>),
             {error, ?CLOSE_POLICY_VIOLATION};
         {invalid_creds, {undefined, Pass}} when is_binary(Pass) ->
-            ?LOG_ERROR("MQTT login failed: no username is provided"),
+            ?LOG_ERROR("OCPP login failed: no username is provided"),
             auth_attempt_failed(PeerIp, <<>>),
             {error, ?CLOSE_POLICY_VIOLATION};
         {invalid_creds, {User, _Pass}} when is_binary(User) ->
-            ?LOG_ERROR("MQTT login failed for user '~s': no password provided", [User]),
+            ?LOG_ERROR("OCPP login failed for user '~s': no password provided", [User]),
             auth_attempt_failed(PeerIp, User),
             {error, ?CLOSE_POLICY_VIOLATION}
     end.
 
-creds(User, Pass, SSLLoginName) ->
+creds(ClientId, User, Pass, SSLLoginName) ->
     CredentialsProvided = User =/= undefined orelse Pass =/= undefined,
     ValidCredentials = is_binary(User) andalso is_binary(Pass) andalso Pass =/= <<>>,
-    TLSAuth = application:get_env(?APP_NAME, ssl_cert_login, false),
-    SSLLoginProvided = TLSAuth =:= true andalso SSLLoginName =/= none,
+    SSLLoginProvided = SSLLoginName =/= none,
 
     case {CredentialsProvided, ValidCredentials, SSLLoginProvided} of
-        {true, true, _} ->
-            %% Username and password take priority
+        %% If a validated client cert is present, use it as the principal.
+        %% This lets the TLS listener support OCPP Security Profile 3 first,
+        %% while still allowing Profile 2 clients to fall back to Basic auth.
+        {_, _, true} when SSLLoginName =:= ClientId ->
+            {ok, SSLLoginName, none};
+        {_, _, true} ->
+            {invalid_cert_creds, SSLLoginName};
+        {true, true, false} ->
             {ok, User, Pass};
-        {true, false, _} ->
+        {true, false, false} ->
             %% Either username or password is provided
             {invalid_creds, {User, Pass}};
-        {false, false, true} ->
-            %% rabbitmq_web_ocpp.ssl_cert_login is true. SSL user name provided.
-            %% Authenticating using username only.
-            {ok, SSLLoginName, none};
         {false, false, false} ->
             AllowAnon = application:get_env(?APP_NAME, allow_anonymous, false),
             case AllowAnon of
@@ -441,9 +449,8 @@ check_vhost_access(Vhost, User, _ClientId, PeerIp, AuthzCtx) ->
     end.
 
 check_user_login(Vhost, Username, Password, ClientId, PeerIp) ->
-    %% For OCPP, Password might be 'none' if using cert auth or no auth
-    EffectivePassword = case Password of none -> <<>> ; _ -> Password end,
-    AuthProps = [{vhost, Vhost}, {client_id, ClientId}, {password, EffectivePassword}],
+    AuthProps = [{vhost, Vhost}, {client_id, ClientId}, {password, Password}],
+    % For cases when authenticating using an x.509 certificate, Password equals atom "none"
     case rabbit_access_control:check_user_login(Username, AuthProps) of
         {ok, User = #user{username = RabbitUser}} ->
             notify_auth_result(user_authentication_success, RabbitUser, PeerIp),
@@ -541,6 +548,8 @@ i(SSL, #state{socket = Sock})
        SSL =:= ssl_hash ->
     rabbit_ssl:info(SSL, {rabbit_net:unwrap_socket(Sock),
                           rabbit_net:maybe_get_proxy_socket(Sock)});
+i(ssl_login_name, #state{ssl_login_name = Val}) ->
+    Val;
 i(name, S) ->
     i(conn_name, S);
 i(conn_name, #state{conn_name = Val}) ->

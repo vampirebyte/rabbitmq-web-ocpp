@@ -57,6 +57,10 @@
     [{datatype, string}, {validators, ["file_accessible"]}]}.
 {mapping, "web_ocpp.ssl.password", "rabbitmq_web_ocpp.ssl_config.password",
     [{datatype, [tagged_binary, binary]}]}.
+{mapping, "web_ocpp.ssl.verify", "rabbitmq_web_ocpp.ssl_config.verify",
+    [{datatype, {enum, [verify_peer, verify_none]}}]}.
+{mapping, "web_ocpp.ssl.fail_if_no_peer_cert", "rabbitmq_web_ocpp.ssl_config.fail_if_no_peer_cert",
+    [{datatype, {enum, [true, false]}}]}.
 
 {translation,
     "rabbitmq_web_ocpp.ssl_config",
