@@ -114,6 +114,7 @@ end).
          client_properties,
          peer_cert_issuer,
          peer_cert_subject,
+         peer_cert_serial_number,
          peer_cert_validity,
          auth_mechanism,
          timeout,

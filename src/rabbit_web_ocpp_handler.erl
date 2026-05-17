@@ -89,7 +89,7 @@ init(Req, Opts) ->
             Result = maybe
                 ok ?= check_vhost_exists(Vhost, ClientId, PeerIp),
                 ok ?= check_vhost_alive(Vhost),
-                {ProtoVer, Req1} ?= pick_protocol(Req, ClientId),
+                {ok, ProtoVer, Req1} ?= pick_protocol(Req, ClientId),
                 {ok, Username1, Password1} ?= check_credentials(ClientId, Username0, Password0, SslLoginName, PeerIp),
                 {ok, User0} ?= check_user_login(Vhost, Username1, Password1, ClientId, PeerIp),
                 AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>},
@@ -232,10 +232,9 @@ websocket_info({'EXIT', _, _}, State) ->
 websocket_info({'$gen_cast', QueueEvent = {queue_event, _, _}},
                State = #state{proc_state = PState0}) ->
     case rabbit_web_ocpp_processor:handle_info(QueueEvent, PState0) of
-        {ok, PState} ->
-            % Update the processor state and return to the WebSocket handler
+        {ok, PState, Frames} ->
             NewState = State#state{proc_state = PState},
-            {[], NewState, hibernate};
+            {Frames, NewState, hibernate};
         {error, Reason, PState} ->
             ?LOG_ERROR("Web OCPP connection ~p failed to handle queue event: ~p",
                        [State#state.conn_name, Reason]),
@@ -349,7 +348,7 @@ pick_protocol(Req, ClientId) ->
                                [ProtoList, ClientId]),
                     {error, invalid_subprotocol};
                 [{Matched, Ver}|_] ->
-                    {Ver, cowboy_req:set_resp_header(<<"sec-websocket-protocol">>, Matched, Req)}
+                    {ok, Ver, cowboy_req:set_resp_header(<<"sec-websocket-protocol">>, Matched, Req)}
             end
     end.
 
@@ -559,8 +558,12 @@ i(client_id, #state{client_id = Val}) ->
 i(Cert, #state{socket = Sock})
   when Cert =:= peer_cert_issuer;
        Cert =:= peer_cert_subject;
+       Cert =:= peer_cert_serial_number;
        Cert =:= peer_cert_validity ->
-    rabbit_ssl:cert_info(Cert, rabbit_net:unwrap_socket(Sock));
+    try rabbit_ssl:cert_info(Cert, rabbit_net:unwrap_socket(Sock))
+    %% serial_number not upstream yet
+    catch error:function_clause -> <<>>
+    end;
 i(state, S) ->
     i(connection_state, S);
 i(connection_state, #state{connection_state = Val}) ->

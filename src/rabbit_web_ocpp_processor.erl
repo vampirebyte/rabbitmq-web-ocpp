@@ -72,7 +72,10 @@
 -record(state, {
     cfg :: #cfg{},
     queue_states :: rabbit_queue_type:state(), % State for managing the queue consumer
-    auth_state :: #auth_state{} % Re-use auth_state structure
+    auth_state :: #auth_state{}, % Re-use auth_state structure
+    %% Outbound WebSocket frames accumulated during a single handle_info/2 call,
+    %% drained and returned to cowboy in one go. Stored in reverse order.
+    pending_frames = [] :: [cowboy_websocket:frame()]
 }).
 
 -opaque state() :: #state{}.
@@ -218,42 +221,6 @@ process_incoming(McOcpp = #ocpp_msg{},
             {error, Error, State}
     end.
 
-binding_action_with_checks(QName, TopicFilter, BindingArgs, Action,
-                           State = #state{cfg = #cfg{exchange = ExchangeName},
-                                          auth_state = AuthState}) ->
-    %% Same permissions required for binding or unbinding queue to/from topic exchange.
-    maybe
-        ok ?= check_queue_write_access(QName, AuthState),
-        ok ?= check_exchange_read_access(ExchangeName, AuthState),
-        ok ?= check_topic_access(TopicFilter, read, State),
-        ok ?= binding_action(ExchangeName, TopicFilter, QName, BindingArgs,
-                             fun rabbit_binding:Action/2, AuthState)
-    else
-        {error, Reason} = Err ->
-            ?LOG_ERROR("Failed to ~s binding between ~s and ~s for topic filter ~s: ~p",
-                       [Action, rabbit_misc:rs(ExchangeName), rabbit_misc:rs(QName), TopicFilter, Reason]),
-            Err
-    end.
-
-check_queue_write_access(QName, #auth_state{user = User,
-                                            authz_ctx = AuthzCtx}) ->
-    %% write access to queue required for queue.(un)bind
-    check_resource_access(User, QName, write, AuthzCtx).
-
-check_exchange_read_access(ExchangeName, #auth_state{user = User,
-                                                     authz_ctx = AuthzCtx}) ->
-    %% read access to exchange required for queue.(un)bind
-    check_resource_access(User, ExchangeName, read, AuthzCtx).
-
-binding_action(ExchangeName, TopicFilter, QName, BindingArgs,
-               BindingFun, #auth_state{user = #user{username = Username}}) ->
-    % RoutingKey = mqtt_to_amqp(TopicFilter),
-    Binding = #binding{source = ExchangeName,
-                       destination = QName,
-                    %    key = RoutingKey,
-                       args = BindingArgs},
-    BindingFun(Binding, Username).
-
 % publish_to_queues(
 %   #mqtt_msg{topic = Topic,
 %             packet_id = PacketId} = MqttMsg,
@@ -333,21 +300,21 @@ remove_duplicate_client_id_connections(PgGroup, PidToKeep) ->
     end.
 
 %% Handle internal messages, queue events, etc.
--spec handle_info(term(), state()) -> {ok, state()} | {stop, term(), state()}.
+-spec handle_info(term(), state()) -> {ok, state(), cowboy_websocket:commands()} | {stop, term(), state()}.
 handle_info({queue_event, QName, Evt}, State = #state{queue_states = QStates0}) ->
     case rabbit_queue_type:handle_event(QName, Evt, QStates0) of
         {ok, QStates, Actions} ->
             State1 = State#state{queue_states = QStates},
-            {ok, handle_queue_actions(Actions, State1)};
+            drain_frames(handle_queue_actions(Actions, State1));
         {protocol_error, _, _, _} = Error ->
             {stop, {shutdown, Error}, State};
         {eol, Actions} -> % Queue deleted or gone
              State1 = handle_queue_actions(Actions, State),
              QStates = rabbit_queue_type:remove(QName, QStates0),
-             {ok, State1#state{queue_states = QStates}};
+             drain_frames(State1#state{queue_states = QStates});
         Other ->
              ?LOG_WARNING("Unhandled queue event for ~ts: ~p", [rabbit_misc:rs(QName), Other]),
-             {ok, State}
+             drain_frames(State)
     end;
 
 handle_info({'DOWN', _, process, Pid, Reason}, State = #state{queue_states = QStates0}) ->
@@ -355,13 +322,13 @@ handle_info({'DOWN', _, process, Pid, Reason}, State = #state{queue_states = QSt
     case rabbit_queue_type:handle_down(Pid, undefined, Reason, QStates0) of
          {ok, QStates1, Actions} ->
             State1 = State#state{queue_states = QStates1},
-            {ok, handle_queue_actions(Actions, State1)};
+            drain_frames(handle_queue_actions(Actions, State1));
          {eol, QStates1, _QRef} -> % Queue is gone
              ?LOG_WARNING("OCPP queue process ~p down, queue is gone (EOL)", [Pid]),
-             {ok, State#state{queue_states = QStates1}}; % Just update state
+             drain_frames(State#state{queue_states = QStates1});
          _ ->
              ?LOG_WARNING("OCPP queue process ~p down, reason: ~p", [Pid, Reason]),
-             {ok, State}
+             drain_frames(State)
     end;
 
 handle_info(connection_closed, State) -> % Message from RabbitMQ core if underlying socket closes
@@ -370,7 +337,12 @@ handle_info(connection_closed, State) -> % Message from RabbitMQ core if underly
 
 handle_info(Msg, State = #state{cfg = #cfg{client_id = ClientId}}) ->
     ?LOG_WARNING("OCPP processor for ~ts received unknown message: ~p", [ClientId, Msg]),
-    {ok, State}.
+    drain_frames(State).
+
+%% Drain accumulated outbound frames and return them to the caller along with
+%% a state that no longer holds them.
+drain_frames(State = #state{pending_frames = Frames}) ->
+    {ok, State#state{pending_frames = []}, lists:reverse(Frames)}.
 
 %% Terminate the processor
 -spec terminate(any(), rabbit_event:event_props(), state()) -> ok.
@@ -427,16 +399,14 @@ generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action},
 %% Handle actions resulting from queue events (deliveries, etc.)
 handle_queue_actions([], State) -> State;
 handle_queue_actions([{deliver, ?CONSUMER_TAG, AckRequired, Msgs} | Rest], State) ->
-    ?LOG_DEBUG("OCPP handling 'deliver' action. AckRequired: ~p, Msgs: ~tp", [AckRequired, Msgs]), % Added logging
+    ?LOG_DEBUG("OCPP handling 'deliver' action. AckRequired: ~p, Msgs: ~tp", [AckRequired, Msgs]),
     State1 = deliver_to_client(Msgs, AckRequired, State),
     handle_queue_actions(Rest, State1);
 handle_queue_actions([{settled, _QName, _MsgIds} | Rest], State) ->
-    ?LOG_DEBUG("OCPP handling 'settled' action for MsgIds: ~tp", [_MsgIds]), % Added logging
-    %% We auto-ack after sending, so settled from queue isn't primary mechanism here
+    ?LOG_DEBUG("OCPP handling 'settled' action for MsgIds: ~tp", [_MsgIds]),
     handle_queue_actions(Rest, State);
 handle_queue_actions([{block, QName} | Rest], State = #state{cfg = #cfg{client_id=ClientId}}) ->
     ?LOG_WARNING("OCPP queue ~ts blocked for ClientId ~ts", [QName, ClientId]),
-    % Could potentially signal backpressure to WebSocket handler if needed
     handle_queue_actions(Rest, State);
 handle_queue_actions([{unblock, QName} | Rest], State = #state{cfg = #cfg{client_id=ClientId}}) ->
      ?LOG_INFO("OCPP queue ~ts unblocked for ClientId ~ts", [QName, ClientId]),
@@ -445,36 +415,30 @@ handle_queue_actions([Action | Rest], State) ->
     ?LOG_DEBUG("OCPP unhandled queue action: ~p", [Action]),
     handle_queue_actions(Rest, State).
 
-%% Deliver messages from the queue to the OCPP client via WebSocket
+%% Deliver messages from the queue to the OCPP client via WebSocket.
+%% Outbound frames are buffered into State#state.pending_frames and drained
+%% by handle_info/2, which returns them directly to cowboy. This avoids the
+%% prior `self() ! {reply, Data}` indirection.
 deliver_to_client([], _AckRequired, State) -> State;
 deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
-                  State = #state{cfg = #cfg{send_fun = SendFun, client_id = ClientId,
-                                                  trace_state = TraceState, conn_name = ConnName},
+                  State = #state{cfg = #cfg{client_id = ClientId,
+                                            trace_state = TraceState, conn_name = ConnName},
                                  queue_states = QStates0,
                                  auth_state = #auth_state{user = User}}) ->
     try
         McOcpp = mc:convert(mc_ocpp, Mc, mc_env()),
-        Payload = mc:protocol_state(McOcpp),
-        case Payload of
+        case mc:protocol_state(McOcpp) of
              #ocpp_msg{payload = BinaryPayload} when is_binary(BinaryPayload) ->
-                ?LOG_DEBUG("OCPP delivering raw message to ~ts", [ClientId]),
+                ?LOG_DEBUG("OCPP delivering message to ~ts for QMsgId ~p", [ClientId, QMsgId]),
                 rabbit_trace:tap_out({QName, QPid, QMsgId, _Redelivered, Mc}, ConnName, User#user.username, TraceState),
-                case SendFun(BinaryPayload) of
-                    ok ->
-                        ?LOG_DEBUG("OCPP SendFun succeeded for QMsgId ~p", [QMsgId]), % Added logging
-                        {ok, QStates1, Actions1} = rabbit_queue_type:settle(
-                            QName, complete, ?CONSUMER_TAG, [QMsgId], QStates0),
-                        State2 = handle_queue_actions(Actions1, State#state{queue_states = QStates1}),
-                        deliver_to_client(Rest, AckRequired, State2);
-                    {error, SendError} ->
-                        ?LOG_ERROR("OCPP failed to send message to ~ts: ~p", [ClientId, SendError]),
-                        {ok, QStates2, Actions2} = rabbit_queue_type:settle(
-                            QName, discard, ?CONSUMER_TAG, [QMsgId], QStates0),
-                        State3 = handle_queue_actions(Actions2, State#state{queue_states = QStates2}),
-                        deliver_to_client(Rest, AckRequired, State3)
-                end;
-            _ ->
-                ?LOG_ERROR("OCPP delivery error: Expected #ocpp_msg{} record but got ~tp", [Payload]),
+                {ok, QStates1, Actions1} = rabbit_queue_type:settle(
+                    QName, complete, ?CONSUMER_TAG, [QMsgId], QStates0),
+                State1 = buffer_frame({text, BinaryPayload}, State#state{queue_states = QStates1}),
+                State2 = handle_queue_actions(Actions1, State1),
+                ok = maybe_notify_sent(QName, QPid, State2),
+                deliver_to_client(Rest, AckRequired, State2);
+            Other ->
+                ?LOG_ERROR("OCPP delivery error: Expected #ocpp_msg{} record but got ~tp", [Other]),
                 {ok, QStates3, Actions3} = rabbit_queue_type:settle(
                     QName, discard, ?CONSUMER_TAG, [QMsgId], QStates0),
                 State4 = handle_queue_actions(Actions3, State#state{queue_states = QStates3}),
@@ -487,6 +451,17 @@ deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
             QName, discard, ?CONSUMER_TAG, [QMsgId], QStates0),
         State5 = handle_queue_actions(Actions4, State#state{queue_states = QStates4}),
         deliver_to_client(Rest, AckRequired, State5)
+    end.
+
+buffer_frame(Frame, State = #state{pending_frames = Frames}) ->
+    State#state{pending_frames = [Frame | Frames]}.
+
+maybe_notify_sent(QName, QPid, #state{queue_states = QStates}) ->
+    case rabbit_queue_type:module(QName, QStates) of
+        {ok, rabbit_classic_queue} ->
+            rabbit_amqqueue:notify_sent(QPid, self());
+        _ ->
+            ok
     end.
 
 %% Ensure the queue exists and is bound
