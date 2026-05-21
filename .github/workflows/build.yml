@@ -10,20 +10,24 @@ jobs:
       matrix:
         PLATFORM:
           - { RMQREF: "4.0.9", ERLVER: "26.2", ELXVER: "1.16" }
-          - { RMQREF: "4.1.4", ERLVER: "27", ELXVER: "1.18" }
-          - { RMQREF: "4.2.4", ERLVER: "27", ELXVER: "1.19" }
+          - { RMQREF: "4.1.8", ERLVER: "27", ELXVER: "1.18" }
+          - { RMQREF: "4.2.7", ERLVER: "27", ELXVER: "1.19" }
+          - { RMQREF: "4.3.1", ERLVER: "27", ELXVER: "1.19" }
     name: "Broker: ${{ matrix.PLATFORM.RMQREF }} - Erlang: ${{ matrix.PLATFORM.ERLVER }} - Elixir: ${{ matrix.PLATFORM.ELXVER }}"
     steps:
       - name: Checkout RabbitMQ Server
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: rabbitmq/rabbitmq-server
           ref: v${{ matrix.PLATFORM.RMQREF }}
           path: ${{ env.SERVER_FOLDER }}
       - name: Checkout Plugin
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: ${{ env.PLUGIN_FOLDER }}
+      - name: Set short SHA
+        id: vars
+        run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - name: Install Erlang and Elixir
         uses: erlef/setup-beam@v1
         with:
@@ -34,8 +38,8 @@ jobs:
         run: |
           make dist RABBITMQ_VERSION=${{ matrix.PLATFORM.RMQREF }} MIX_ENV=prod DIST_AS_EZS=yes
       - name: Store build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: plugins-ocpp-rmq${{ matrix.PLATFORM.RMQREF }}-erl${{ matrix.PLATFORM.ERLVER }}-elx${{ matrix.PLATFORM.ELXVER }}
+          name: plugins-ocpp-rmq${{ matrix.PLATFORM.RMQREF }}-erl${{ matrix.PLATFORM.ERLVER }}-elx${{ matrix.PLATFORM.ELXVER }}-${{ steps.vars.outputs.value }}
           path: |
             ${{ env.PLUGIN_FOLDER }}/plugins/rabbitmq_web_ocpp-[0-9].*.ez
