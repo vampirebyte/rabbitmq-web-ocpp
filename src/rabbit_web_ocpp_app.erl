@@ -105,11 +105,11 @@ init_global_counters() ->
                                                ?OCPP_PROTO_V21]).
 
 init_global_counters(ProtoVer) ->
-    Proto = {protocol, ProtoVer},
-    rabbit_global_counters:init([Proto]),
-    rabbit_global_counters:init([Proto, {queue_type, rabbit_classic_queue}]),
-    rabbit_global_counters:init([Proto, {queue_type, rabbit_quorum_queue}]),
-    rabbit_global_counters:init([Proto, {queue_type, rabbit_stream_queue}]).
+    %% Proto = {protocol, ProtoVer}, since v4.2.0 proplists are not supported anymore.
+    rabbit_global_counters:init(#{protocol => ProtoVer}),
+    rabbit_global_counters:init(#{protocol => ProtoVer, queue_type => rabbit_classic_queue}),
+    rabbit_global_counters:init(#{protocol => ProtoVer, queue_type => rabbit_quorum_queue}),
+    rabbit_global_counters:init(#{protocol => ProtoVer, queue_type => rabbit_stream_queue}).
 
 ocpp_init() ->
     CowboyOpts0  = maps:from_list(get_env(cowboy_opts, [])),

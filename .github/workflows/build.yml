@@ -9,8 +9,8 @@ jobs:
     strategy:
       matrix:
         PLATFORM:
-          - { RMQREF: "4.0.9", ERLVER: "26.2", ELXVER: "1.16" }
-          - { RMQREF: "4.1.8", ERLVER: "27", ELXVER: "1.18" }
+          # - { RMQREF: "4.0.9", ERLVER: "26.2", ELXVER: "1.16" }
+          # - { RMQREF: "4.1.8", ERLVER: "27", ELXVER: "1.18" }
           - { RMQREF: "4.2.7", ERLVER: "27", ELXVER: "1.19" }
           - { RMQREF: "4.3.1", ERLVER: "27", ELXVER: "1.19" }
     name: "Broker: ${{ matrix.PLATFORM.RMQREF }} - Erlang: ${{ matrix.PLATFORM.ERLVER }} - Elixir: ${{ matrix.PLATFORM.ELXVER }}"
