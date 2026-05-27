@@ -169,48 +169,47 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {Pe
 %% Process incoming OCPP message (parsed list + raw binary)
 -spec process_incoming(McOcpp :: #ocpp_msg{}, state()) -> {ok, state()} | {error, term(), state()}.
 process_incoming(McOcpp = #ocpp_msg{},
-                State = #state{cfg = #cfg{exchange = ExchangeName,
+                State = #state{cfg = #cfg{exchange = ExchangeName = #resource{name = ExchangeNameBin},
                                                     client_id = ClientId,
                                                     trace_state = TraceState,
                                                     conn_name = ConnName},
-                                         auth_state = #auth_state{user = User}}) ->
-    %% 1. Check Publish Permissions (on Exchange and Topic/Routing Key)
-    case check_publish_permitted(ExchangeName, ClientId, State) of
+                                         auth_state = #auth_state{user = #user{username = Username}}}) ->
+
+    %% 1. Generate structured routing key (protocolver.actionname.req/conf)
+    RoutingKey = generate_routing_key(McOcpp, State),
+
+    %% 2. Check Publish Permissions (on Exchange and Topic/Routing Key)
+    case check_publish_permitted(ExchangeName, RoutingKey, State) of
         ok ->
-            %% 2. Validate Exchange
+            %% 3. Validate Exchange
             case rabbit_exchange:lookup(ExchangeName) of
                 {ok, Exchange} ->
-                    %% 3. Generate structured routing key (protocolver.actionname.req/conf)
-                    RoutingKey = generate_routing_key(McOcpp, State),
                     
                     %% 4. Prepare annotations and initialize Message Container (mc) with mc_ocpp type
-                    Anns = #{?ANN_EXCHANGE => ?DEFAULT_EXCHANGE_NAME,
+                    Anns = #{?ANN_EXCHANGE => ExchangeNameBin,
                              ?ANN_ROUTING_KEYS => [RoutingKey]},
-                    case mc:init(mc_ocpp, McOcpp, Anns, #{}) of
-                        McMsg ->
-                            ?LOG_DEBUG("Created message container for ClientId ~ts with routing key ~ts: ~tp", 
-                                      [ClientId, RoutingKey, McMsg]),
-                            %% 5. Trace (optional)
-                            rabbit_trace:tap_in(McMsg, [ExchangeName], ConnName, User#user.username, TraceState),
-
-                            %% 6. Publish to the exchange with the structured routing key
-                            case rabbit_exchange:route(Exchange, McMsg, #{}) of
-                                ok ->
-                                    ?LOG_INFO("Message routed successfully for ClientId ~ts", [ClientId]),
-                                    {ok, State};
-                                QNames when is_list(QNames) ->
-                                    ?LOG_INFO("Message routed to ~p queues for ClientId ~ts: ~p",
-                                              [length(QNames), ClientId, QNames]),
-                                    deliver_to_queues(McMsg, #{}, QNames, State),
-                                    {ok, State};
-                                {error, Reason} ->
-                                    ?LOG_ERROR("OCPP failed to route message via exchange ~ts: ~p",
-                                               [rabbit_misc:rs(ExchangeName), Reason]),
-                                    {error, {publish_failed, Reason}, State}
-                            end;
-                        _ ->
-                            ?LOG_ERROR("Failed to initialize mc_ocpp message for ClientId ~ts", [ClientId]),
-                            {error, {invalid_mc_msg, McOcpp}, State}
+                    McMsg = mc:init(mc_ocpp, McOcpp, Anns, #{}),
+                    ?LOG_DEBUG("Created message container for ClientId ~ts with routing key ~ts: ~tp", 
+                                [ClientId, RoutingKey, McMsg]),
+                    
+                    %% 5. Publish to the exchange with the structured routing key
+                    case rabbit_exchange:route(Exchange, McMsg, #{}) of
+                        [] ->
+                            ?LOG_WARNING("OCPP message from ClientId ~ts routed to 0 queues. "
+                                        "Exchange: ~ts, routing key: ~ts",
+                                        [ClientId, rabbit_misc:rs(ExchangeName), RoutingKey]),
+                            {ok, State};
+                        QNames when is_list(QNames) ->
+                            %% 6. Trace (optional)
+                            rabbit_trace:tap_in(McMsg, QNames, ConnName, Username, TraceState),
+                            ?LOG_INFO("OCPP message routed to ~p queues for ClientId ~ts: ~p",
+                                        [length(QNames), ClientId, QNames]),
+                            deliver_to_queues(McMsg, #{}, QNames, State),
+                            {ok, State};
+                        {error, Reason} ->
+                            ?LOG_ERROR("OCPP failed to route message via exchange ~ts: ~p",
+                                        [rabbit_misc:rs(ExchangeName), Reason]),
+                            {error, {publish_failed, Reason}, State}
                     end;
                 {error, not_found} ->
                     ?LOG_ERROR("Exchange ~ts does not exist for ClientId ~ts", [rabbit_misc:rs(ExchangeName), ClientId]),
@@ -250,7 +249,7 @@ deliver_to_queues(Message,
                   State0 = #state{queue_states = QStates0,
                                   cfg = #cfg{proto_ver = ProtoVer}}) ->
     FilteredQNames = drop_local(RoutedToQNames, State0),
-    Qs0 = rabbit_amqqueue:lookup_many(FilteredQNames),
+    Qs0 = lookup_queue_targets(FilteredQNames),
     Qs = rabbit_amqqueue:prepend_extra_bcc(Qs0),
     ?LOG_DEBUG("Delivering to queue ~p with state ~p", [Qs, QStates0]),
     case rabbit_queue_type:deliver(Qs, Message, Options, QStates0) of
@@ -274,6 +273,16 @@ drop_local(QNames, #state{cfg = #cfg{queue_name = OwnQueueName}}) ->
     lists:filter(fun(QName) -> QName =/= OwnQueueName end, QNames);
 drop_local(QNames, _) ->
     QNames.
+
+lookup_queue_targets(QNames) ->
+    case erlang:function_exported(rabbit_db_queue, get_targets, 1) of
+        true ->
+            %% RabbitMQ v4.2.x
+            rabbit_db_queue:get_targets(QNames);
+        false ->
+            %% RabbitMQ <= v4.1.x
+            rabbit_amqqueue:lookup_many(QNames)
+    end.
 
 -spec register_client_id(rabbit_types:vhost(), client_id()) -> ok.
 register_client_id(Vhost, ClientId)
@@ -613,9 +622,9 @@ queue_name(Vhost, ClientId) ->
 %% --- Permission Checks (Simplified wrappers around MQTT versions) ---
 
 %% Check permissions for publishing to the OCPP exchange
-check_publish_permitted(Exchange, CPID, State = #state{auth_state = AuthState}) ->
+check_publish_permitted(Exchange, RoutingKey, State = #state{auth_state = AuthState}) ->
     case check_resource_access(AuthState#auth_state.user, Exchange, write, AuthState#auth_state.authz_ctx) of
-        ok -> check_topic_access(CPID, write, State); % Also check routing key permission
+        ok -> check_topic_access(RoutingKey, write, State);
         Err -> Err
     end.
 
@@ -663,15 +672,15 @@ check_topic_access(
                 undefined -> [];
                 Other     -> Other
             end,
-    Key = {RoutingKey, Username, ClientId, Vhost, XNameBin, Access}, % TODO check if RoutingKey is OK
+    Key = {RoutingKey, Username, ClientId, Vhost, XNameBin, Access},
     case lists:member(Key, Cache) of
         true ->
             ok;
         false ->
             Resource = XName#resource{kind = topic},
             Context = #{routing_key  => RoutingKey,
-                        variable_map => #{<<"username">> => Username,
-                                          <<"vhost">> => Vhost,
+                        variable_map => #{<<"username">>  => Username,
+                                          <<"vhost">>     => Vhost,
                                           <<"client_id">> => ClientId}},
             try rabbit_access_control:check_topic_access(User, Resource, Access, Context) of
                 ok ->
@@ -681,7 +690,7 @@ check_topic_access(
             catch
                 exit:#amqp_error{name = access_refused,
                                  explanation = Msg} ->
-                    ?LOG_ERROR("MQTT topic access refused: ~s", [Msg]),
+                    ?LOG_ERROR("OCPP topic access refused: ~s", [Msg]),
                     {error, access_refused}
             end
     end.
