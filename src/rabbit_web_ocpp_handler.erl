@@ -77,12 +77,18 @@ init(Req, Opts) ->
     Vhost = cowboy_req:binding(vhost, Req),
     ClientId = cowboy_req:binding(client_id, Req),
     {PeerIp, _PeerPort} = cowboy_req:peer(Req),
+    %% The transport socket is not accessible before the WebSocket takeover,
+    %% so rejected connections cannot use rabbit_net:connection_string/2.
+    %% Keep the peer address for rejection logging instead.
+    PeerAddr = peer_addr(Req),
 
     case {Vhost, ClientId} of
         {<<>>, _} ->
-            {ok, cowboy_req:reply(404, #{}, <<"Vhost not specified">>, Req), #state{}};
+            {ok, cowboy_req:reply(404, #{}, <<"Vhost not specified">>, Req),
+             #state{conn_name = PeerAddr}};
         {_, <<>>} ->
-            {ok, cowboy_req:reply(404, #{}, <<"Client ID not specified">>, Req), #state{}};
+            {ok, cowboy_req:reply(404, #{}, <<"Client ID not specified">>, Req),
+             #state{conn_name = PeerAddr}};
         _ ->
             {Username0, Password0} = basic_auth_creds(Req),
             SslLoginName = ssl_login_name_from_req(Req),
@@ -92,10 +98,14 @@ init(Req, Opts) ->
                 {ok, ProtoVer, Req1} ?= pick_protocol(Req, ClientId),
                 {ok, Username1, Password1} ?= check_credentials(ClientId, Username0, Password0, SslLoginName, PeerIp),
                 {ok, User0} ?= check_user_login(Vhost, Username1, Password1, ClientId, PeerIp),
+                ok ?= check_user_loopback(User0, PeerIp),
                 AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>},
                 ok ?= check_vhost_access(Vhost, User0, ClientId, PeerIp, AuthzCtx),
                 {ok, Req1, Vhost, ClientId, User0, ProtoVer}
             end,
+            %% Keep identifying info in the state so terminate/3 can log
+            %% meaningfully when the connection is rejected below.
+            RejState = #state{vhost = Vhost, client_id = ClientId, conn_name = PeerAddr},
             case Result of
                 {ok, Req2, V2, CId, User, ProtocolVer} ->
                     ProxyInfo   = maps:get(proxy_header, Req2, undefined),
@@ -108,16 +118,16 @@ init(Req, Opts) ->
                                    ssl_login_name = SslLoginName},
                     {?MODULE, Req2, State, WsOpts};
                 {error, bad_vhost} ->
-                    {ok, cowboy_req:reply(404, #{}, <<"Invalid Vhost">>, Req), #state{}};
+                    {ok, cowboy_req:reply(404, #{}, <<"Invalid Vhost">>, Req), RejState};
                 {error, vhost_down} ->
-                    {ok, cowboy_req:reply(503, #{}, <<"Vhost is down">>, Req), #state{}};
+                    {ok, cowboy_req:reply(503, #{}, <<"Vhost is down">>, Req), RejState};
                 {error, invalid_subprotocol} ->
                     {ok, cowboy_req:reply(400, #{<<"connection">> => <<"close">>},
-                                          <<"Unsupported or missing OCPP subprotocol">>, Req), #state{}};
+                                          <<"Unsupported or missing OCPP subprotocol">>, Req), RejState};
                 {error, _} ->
                     {ok, cowboy_req:reply(401,
                           #{<<"www-authenticate">> => <<"Basic realm=\"OCPP\"">>},
-                          <<"Unauthorized">>, Req), #state{}}
+                          <<"Unauthorized">>, Req), RejState}
             end
     end.
 
@@ -139,10 +149,12 @@ info(Pid, Items) ->
     {cowboy_websocket:commands(), state, hibernate}.
 websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = ClientId, user = User, proto_ver = ProtoVer}) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_CONN ++ [web_ocpp]}),
+    %% The socket (incl. proxy protocol info) is only available from
+    %% takeover/7 onwards, so the proper connection name can only be
+    %% built here, not in init/2.
     case rabbit_net:connection_string(Socket, inbound) of
         {ok, ConnStr} ->
             ConnName = rabbit_data_coercion:to_binary(ConnStr),
-            ?LOG_INFO("Accepting Web OCPP connection ~s for client ID ~p", [ConnName, ClientId]),
             State1 = State0#state{conn_name = ConnName},
             State2 = rabbit_event:init_stats_timer(State1, #state.stats_timer),
             % Inside `init` of the processor "connection_created" is called for management UI to show the connection
@@ -300,18 +312,22 @@ websocket_info(Msg, State) ->
     ?LOG_WARNING("Web OCPP: unexpected message ~tp", [Msg]),
     {[], State, hibernate}.
 
+terminate(_Reason, _Request, #state{proc_state = undefined,
+                                    client_id = ClientId,
+                                    conn_name = ConnName}) ->
+    %% Connection was rejected before a session was established (unknown vhost,
+    %% missing/invalid subprotocol, failed authentication, processor init
+    %% failure). The specific reason has already been logged at error level.
+    ?LOG_DEBUG("Web OCPP connection ~ts rejected before session started for client ID ~p",
+               [ConnName, ClientId]),
+    ok;
 terminate(Reason, _Request, #state{conn_name = ConnName,
-                            proc_state = PState, % Can be undefined if init crashed
+                            proc_state = PState,
                             client_id = ClientId} = State) ->
     ?LOG_INFO("Web OCPP closing connection ~ts for client ID ~p", [ConnName, ClientId]),
     maybe_emit_stats(State),
-    case PState of
-        undefined ->
-            ok;
-        _ ->
-            Infos = infos(?EVENT_KEYS, State),
-            rabbit_web_ocpp_processor:terminate(Reason, Infos, PState)
-    end;
+    Infos = infos(?EVENT_KEYS, State),
+    rabbit_web_ocpp_processor:terminate(Reason, Infos, PState);
 
 terminate(Reason, _Request, Opts) ->
     %% Fallback clause when init crashed before state record was established
@@ -319,6 +335,20 @@ terminate(Reason, _Request, Opts) ->
     ok.
 
 %% Internal.
+
+%% Peer address of a connection before the WebSocket takeover, for logging.
+%% Prefers the source advertised by a PROXY protocol header, applying the
+%% same selection rule as rabbit_net:socket_ends/2 does for proxy sockets.
+-spec peer_addr(cowboy_req:req()) -> binary().
+peer_addr(Req) ->
+    {Ip, Port} = case maps:get(proxy_header, Req, undefined) of
+                     #{src_address := SrcIp, src_port := SrcPort} ->
+                         {SrcIp, SrcPort};
+                     _ ->
+                         cowboy_req:peer(Req)
+                 end,
+    rabbit_data_coercion:to_binary(
+      rabbit_misc:format("~s:~b", [rabbit_misc:ntoab(Ip), Port])).
 
 %% Extract SSL login name from the Cowboy request (available before WS upgrade).
 %% Used for mutual TLS / certificate-based authentication.
@@ -420,12 +450,12 @@ creds(ClientId, User, Pass, SSLLoginName) ->
             nocreds
     end.
 
-check_vhost_exists(Vhost, UsernameForLog, PeerIp) ->
+check_vhost_exists(Vhost, ClientId, PeerIp) ->
     case rabbit_vhost:exists(Vhost) of
         true -> ok;
         false ->
             ?LOG_ERROR("OCPP connection failed: vhost '~s' does not exist", [Vhost]),
-            auth_attempt_failed(PeerIp, UsernameForLog),
+            auth_attempt_failed(PeerIp, ClientId),
             {error, bad_vhost}
     end.
 
@@ -459,6 +489,20 @@ check_user_login(Vhost, Username, Password, ClientId, PeerIp) ->
             notify_auth_result(user_authentication_failure, UserForLog, PeerIp),
             auth_attempt_failed(PeerIp, UserForLog),
             {error, authentication_failure}
+    end.
+
+%% Reject users listed in {rabbit, loopback_users} unless they connect from a
+%% loopback address. Mirrors the equivalent check in the other plugins.
+%% Uses the effective post-login username so that anonymous logins (which map
+%% to anonymous_login_user, e.g. 'guest') are also covered.
+check_user_loopback(#user{username = Username}, PeerIp) ->
+    case rabbit_access_control:check_user_loopback(Username, PeerIp) of
+        ok ->
+            ok;
+        not_allowed ->
+            ?LOG_ERROR("OCPP login failed: user '~s' can only connect via localhost", [Username]),
+            auth_attempt_failed(PeerIp, Username),
+            {error, access_refused}
     end.
 
 notify_auth_result(Event, Username, PeerIp) ->

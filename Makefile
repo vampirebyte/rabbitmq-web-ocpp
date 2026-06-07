@@ -9,7 +9,8 @@ define PROJECT_ENV
 	    {num_tcp_acceptors, 10},
 	    {num_ssl_acceptors, 10},
 	    {cowboy_opts, []},
-	    {proxy_protocol, false}
+	    {proxy_protocol, false},
+	    {allow_anonymous, false}
 	  ]
 endef
 

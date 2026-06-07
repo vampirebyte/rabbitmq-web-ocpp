@@ -202,7 +202,7 @@ process_incoming(McOcpp = #ocpp_msg{},
                         QNames when is_list(QNames) ->
                             %% 6. Trace (optional)
                             rabbit_trace:tap_in(McMsg, QNames, ConnName, Username, TraceState),
-                            ?LOG_INFO("OCPP message routed to ~p queues for ClientId ~ts: ~p",
+                            ?LOG_DEBUG("OCPP message routed to ~p queues for ClientId ~ts: ~p",
                                         [length(QNames), ClientId, QNames]),
                             deliver_to_queues(McMsg, #{}, QNames, State),
                             {ok, State};
