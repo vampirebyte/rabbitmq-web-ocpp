@@ -47,6 +47,7 @@
           client_id :: client_id(),
           user :: #user{},
           ssl_login_name = none :: none | binary(),
+          auth_mechanism = <<"UNKNOWN">> :: binary(),
           conn_name :: option(binary()),
           idle_timeout :: timeout(), %% from cowboy, in seconds
           proto_ver :: ocpp_protocol_version_atom()
@@ -115,7 +116,8 @@ init(Req, Opts) ->
                     IdleSec     = case IdleMs of infinity -> 0; Ms -> Ms div 1000 end,
                     State = #state{socket = ProxyInfo, proto_ver = ProtocolVer, vhost = V2,
                                    user = User, client_id = CId, idle_timeout = IdleSec,
-                                   ssl_login_name = SslLoginName},
+                                   ssl_login_name = SslLoginName,
+                                   auth_mechanism = auth_mechanism(Username0, SslLoginName)},
                     {?MODULE, Req2, State, WsOpts};
                 {error, bad_vhost} ->
                     {ok, cowboy_req:reply(404, #{}, <<"Invalid Vhost">>, Req), RejState};
@@ -336,6 +338,17 @@ terminate(Reason, _Request, Opts) ->
 
 %% Internal.
 
+%% Authentication mechanism shown in the management UI. Mirrors the
+%% decision taken by creds/4: a validated client certificate takes
+%% precedence, then HTTP Basic auth, then anonymous.
+-spec auth_mechanism(undefined | binary(), none | binary()) -> binary().
+auth_mechanism(_Username, SslLoginName) when SslLoginName =/= none ->
+    <<"MTLS">>;
+auth_mechanism(undefined, none) ->
+    <<"ANONYMOUS">>;
+auth_mechanism(_Username, none) ->
+    <<"BASIC">>.
+
 %% Peer address of a connection before the WebSocket takeover, for logging.
 %% Prefers the source advertised by a PROXY protocol header, applying the
 %% same selection rule as rabbit_net:socket_ends/2 does for proxy sockets.
@@ -386,9 +399,12 @@ basic_auth_creds(Req) ->
     case cowboy_req:header(<<"authorization">>, Req, <<>>) of
         <<>> -> {undefined, undefined};
         H ->
-            case cow_http_hd:parse_authorization(H) of
+            try cow_http_hd:parse_authorization(H) of
                 {basic, U, P} -> {U, P};
-                _ -> {undefined, undefined}
+                _ -> {invalid, invalid}
+            catch _:_ ->
+                %% Bearer token or malformed value
+                {invalid, invalid}
             end
     end.
 
@@ -403,6 +419,10 @@ check_credentials(ClientId, Username, Password, SslLoginName, PeerIp) ->
             {error, ?CLOSE_POLICY_VIOLATION};
         nocreds ->
             ?LOG_ERROR("OCPP login failed: no credentials provided"),
+            auth_attempt_failed(PeerIp, <<>>),
+            {error, ?CLOSE_POLICY_VIOLATION};
+        {invalid_creds, {invalid, invalid}} ->
+            ?LOG_ERROR("OCPP login failed: malformed or non-Basic Authorization header"),
             auth_attempt_failed(PeerIp, <<>>),
             {error, ?CLOSE_POLICY_VIOLATION};
         {invalid_creds, {undefined, Pass}} when is_binary(Pass) ->
@@ -592,6 +612,8 @@ i(SSL, #state{socket = Sock})
     rabbit_ssl:info(SSL, {rabbit_net:unwrap_socket(Sock),
                           rabbit_net:maybe_get_proxy_socket(Sock)});
 i(ssl_login_name, #state{ssl_login_name = Val}) ->
+    Val;
+i(auth_mechanism, #state{auth_mechanism = Val}) ->
     Val;
 i(name, S) ->
     i(conn_name, S);

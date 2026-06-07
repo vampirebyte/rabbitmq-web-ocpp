@@ -101,8 +101,6 @@ init(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun) ->
     end.
 
 process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {PeerIp, PeerPort, Ip, Port}) ->
-    ?LOG_DEBUG("OCPP init request. ClientId: ~ts, ConnName: ~ts", [ClientId, ConnName0]),
-
     case rabbit_net:socket_ends(Socket, inbound) of
         {ok, SocketEnds} ->
             {PeerIp, PeerPort, Ip, Port} = SocketEnds;
@@ -155,7 +153,7 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {Pe
             {ok, FinalState} ?= consume_from_queue(StateAfterQueue),
 
             ?LOG_INFO("OCPP connection ~ts established for ClientId ~ts on vhost ~ts",
-                      [ConnName, ClientId, Vhost]),
+                      [ConnName0, ClientId, Vhost]),
             {ok, FinalState}
         else
             {error, Reason} ->
@@ -886,8 +884,6 @@ info(client_properties, #state{cfg = #cfg{client_id = ClientId,
 info(channel_max, _) -> 0;
 info(node, _) -> node();
 info(frame_max, _) -> 0; % Not applicable like MQTT
-%% SASL not supported?
-info(auth_mechanism, _) -> <<"BASIC">>;
 info(recv_oct, _) -> erlang:process_info(self(), message_queue_len); % Approx incoming? Needs better metric
 info(send_oct, _) -> 0; % Hard to track accurately here
 info(Other, #state{cfg=#cfg{client_id=ClientId}}) ->
