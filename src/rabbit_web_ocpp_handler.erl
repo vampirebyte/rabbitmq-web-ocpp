@@ -261,6 +261,27 @@ websocket_info({'$gen_cast', {duplicate_id}},
                  [ClientId, ConnName]),
     defer_close(?CLOSE_NORMAL),
     {[], State};
+%% pg group membership events, see rabbit_web_ocpp_processor:register_client_id/2.
+%% Observing the join of another connection with the same client ID means this
+%% connection is the older one and must yield ("last connection wins").
+websocket_info({Ref, join, _PgGroup, Pids},
+               State = #state{client_id = ClientId,
+                              conn_name = ConnName})
+  when is_reference(Ref) ->
+    case Pids -- [self()] of
+        [] ->
+            %% Our own join, reported because the monitor is
+            %% installed before the group is joined.
+            {[], State, hibernate};
+        _ ->
+            ?LOG_WARNING("Web OCPP disconnecting a client with duplicate ID '~s' (~p)",
+                 [ClientId, ConnName]),
+            defer_close(?CLOSE_NORMAL),
+            {[], State}
+    end;
+websocket_info({Ref, leave, _PgGroup, _Pids}, State)
+  when is_reference(Ref) ->
+    {[], State, hibernate};
 websocket_info({'$gen_cast', {close_connection, Reason}},
                State = #state{client_id = ClientId,
                               conn_name = ConnName}) ->
