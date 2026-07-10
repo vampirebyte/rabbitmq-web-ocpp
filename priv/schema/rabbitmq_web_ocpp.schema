@@ -186,6 +186,16 @@ end}.
 {mapping, "web_ocpp.proxy_protocol", "rabbitmq_web_ocpp.proxy_protocol",
     [{datatype, {enum, [true, false]}}]}.
 
+%% Whether to allow anonymous connections, i.e. connections without an
+%% Authorization header and without a client certificate. When enabled,
+%% the connection is authenticated as RabbitMQ's pre-configured anonymous
+%% user (see anonymous_login_user / anonymous_login_pass in rabbitmq.conf).
+%%
+%% {allow_anonymous, false}
+
+{mapping, "web_ocpp.allow_anonymous", "rabbitmq_web_ocpp.allow_anonymous",
+    [{datatype, {enum, [true, false]}}]}.
+
 %%
 %% File Handle Cache
 %%

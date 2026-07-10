@@ -15,7 +15,6 @@
          handle_info/2,
          handle_text_frame/2,
          format_status/1,
-         remove_duplicate_client_id_connections/2,
          proto_version_tuple/1
         ]).
 
@@ -33,7 +32,7 @@
 %% --- Constants ---
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
 -define(DEFAULT_EXCHANGE_NAME, <<"amq.topic">>). % Example exchange name
--define(CONSUMER_TAG, <<"ocpp.consumer">>).
+-define(CONSUMER_TAG_PREFIX, <<"ocpp.consumer.">>).
 -define(QUEUE_KIND, ocpp). % Used for queue naming convention
 -define(PREFETCH_COUNT, 1). % Default prefetch for the OCPP queue
 
@@ -66,6 +65,7 @@
         peer_ip_addr :: inet:ip_address(),
         peer_port :: inet:port_number(),
         trace_state :: rabbit_trace:state(),
+        consumer_tag :: binary(),
         connected_at :: pos_integer()
 }).
 
@@ -101,8 +101,6 @@ init(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun) ->
     end.
 
 process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {PeerIp, PeerPort, Ip, Port}) ->
-    ?LOG_DEBUG("OCPP init request. ClientId: ~ts, ConnName: ~ts", [ClientId, ConnName0]),
-
     case rabbit_net:socket_ends(Socket, inbound) of
         {ok, SocketEnds} ->
             {PeerIp, PeerPort, Ip, Port} = SocketEnds;
@@ -128,6 +126,7 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {Pe
             QueueName = queue_name(Vhost, ClientId),
             Prefetch = application:get_env(rabbit_web_ocpp, prefetch_count, ?PREFETCH_COUNT),
             {TraceState, ConnName} = init_trace(Vhost, ConnName0),
+            ConnectedAt = os:system_time(millisecond),
 
             AuthState = #auth_state{user = User, authz_ctx = AuthzCtx},
             Cfg = #cfg{socket = Socket,
@@ -146,7 +145,8 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {Pe
                        prefetch = Prefetch,
                        conn_name = ConnName,
                        trace_state = TraceState,
-                       connected_at = os:system_time(millisecond)},
+                       consumer_tag = consumer_tag(ConnectedAt),
+                       connected_at = ConnectedAt},
             InitialState = #state{cfg = Cfg,
                                   queue_states = rabbit_queue_type:init(),
                                   auth_state = AuthState},
@@ -155,7 +155,7 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {Pe
             {ok, FinalState} ?= consume_from_queue(StateAfterQueue),
 
             ?LOG_INFO("OCPP connection ~ts established for ClientId ~ts on vhost ~ts",
-                      [ConnName, ClientId, Vhost]),
+                      [ConnName0, ClientId, Vhost]),
             {ok, FinalState}
         else
             {error, Reason} ->
@@ -202,7 +202,7 @@ process_incoming(McOcpp = #ocpp_msg{},
                         QNames when is_list(QNames) ->
                             %% 6. Trace (optional)
                             rabbit_trace:tap_in(McMsg, QNames, ConnName, Username, TraceState),
-                            ?LOG_INFO("OCPP message routed to ~p queues for ClientId ~ts: ~p",
+                            ?LOG_DEBUG("OCPP message routed to ~p queues for ClientId ~ts: ~p",
                                         [length(QNames), ClientId, QNames]),
                             deliver_to_queues(McMsg, #{}, QNames, State),
                             {ok, State};
@@ -288,25 +288,26 @@ lookup_queue_targets(QNames) ->
 register_client_id(Vhost, ClientId)
   when is_binary(Vhost), is_binary(ClientId) ->
     PgGroup = {Vhost, ClientId},
-    ok = pg:join(persistent_term:get(?PG_SCOPE), PgGroup, self()),
-    ok = erpc:multicast([node() | nodes()],
-                        ?MODULE,
-                        remove_duplicate_client_id_connections,
-                        [PgGroup, self()]).
+    PgScope = persistent_term:get(?PG_SCOPE),
+    %% "Last connection wins" without any per-connect cluster-wide calls:
+    %%
+    %% The monitor is installed *before* joining, so the event stream is
+    %% complete: a member never sees joins that happened before its own
+    %% monitor, therefore only an *older* connection can observe the join
+    %% of a newer one, upon which it closes itself (see the corresponding
+    %% websocket_info clauses in rabbit_web_ocpp_handler). This also
+    %% converges after a network partition heals, when pg re-syncs
+    %% memberships, something an erpc broadcast at connect time misses.
+    {_Ref, Members} = pg:monitor(PgScope, PgGroup),
+    ok = pg:join(PgScope, PgGroup, self()),
+    %% Disconnect the already-known members directly rather than
+    %% waiting for them to observe our join.
+    _ = [gen_server:cast(Pid, {duplicate_id}) || Pid <- Members, Pid =/= self()],
+    ok.
 
--spec remove_duplicate_client_id_connections(
-        {rabbit_types:vhost(), client_id()}, pid()) -> ok.
-remove_duplicate_client_id_connections(PgGroup, PidToKeep) ->
-    try persistent_term:get(?PG_SCOPE) of
-        PgScope ->
-            Pids = pg:get_local_members(PgScope, PgGroup),
-            lists:foreach(fun(Pid) ->
-                                  gen_server:cast(Pid, {duplicate_id})
-                          end, Pids -- [PidToKeep])
-    catch _:badarg ->
-        %% OCPP supervision tree on this node not fully started
-        ok
-    end.
+-spec consumer_tag(pos_integer()) -> binary().
+consumer_tag(ConnectedAt) ->
+    <<?CONSUMER_TAG_PREFIX/binary, (integer_to_binary(ConnectedAt))/binary>>.
 
 %% Handle internal messages, queue events, etc.
 -spec handle_info(term(), state()) -> {ok, state(), cowboy_websocket:commands()} | {stop, term(), state()}.
@@ -407,7 +408,7 @@ generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action},
 
 %% Handle actions resulting from queue events (deliveries, etc.)
 handle_queue_actions([], State) -> State;
-handle_queue_actions([{deliver, ?CONSUMER_TAG, AckRequired, Msgs} | Rest], State) ->
+handle_queue_actions([{deliver, _ConsumerTag, AckRequired, Msgs} | Rest], State) ->
     ?LOG_DEBUG("OCPP handling 'deliver' action. AckRequired: ~p, Msgs: ~tp", [AckRequired, Msgs]),
     State1 = deliver_to_client(Msgs, AckRequired, State),
     handle_queue_actions(Rest, State1);
@@ -431,7 +432,8 @@ handle_queue_actions([Action | Rest], State) ->
 deliver_to_client([], _AckRequired, State) -> State;
 deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
                   State = #state{cfg = #cfg{client_id = ClientId,
-                                            trace_state = TraceState, conn_name = ConnName},
+                                            trace_state = TraceState, conn_name = ConnName,
+                                            consumer_tag = ConsumerTag},
                                  queue_states = QStates0,
                                  auth_state = #auth_state{user = User}}) ->
     try
@@ -441,7 +443,7 @@ deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
                 ?LOG_DEBUG("OCPP delivering message to ~ts for QMsgId ~p", [ClientId, QMsgId]),
                 rabbit_trace:tap_out({QName, QPid, QMsgId, _Redelivered, Mc}, ConnName, User#user.username, TraceState),
                 {ok, QStates1, Actions1} = rabbit_queue_type:settle(
-                    QName, complete, ?CONSUMER_TAG, [QMsgId], QStates0),
+                    QName, complete, ConsumerTag, [QMsgId], QStates0),
                 State1 = buffer_frame({text, BinaryPayload}, State#state{queue_states = QStates1}),
                 State2 = handle_queue_actions(Actions1, State1),
                 ok = maybe_notify_sent(QName, QPid, State2),
@@ -449,7 +451,7 @@ deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
             Other ->
                 ?LOG_ERROR("OCPP delivery error: Expected #ocpp_msg{} record but got ~tp", [Other]),
                 {ok, QStates3, Actions3} = rabbit_queue_type:settle(
-                    QName, discard, ?CONSUMER_TAG, [QMsgId], QStates0),
+                    QName, discard, ConsumerTag, [QMsgId], QStates0),
                 State4 = handle_queue_actions(Actions3, State#state{queue_states = QStates3}),
                 deliver_to_client(Rest, AckRequired, State4)
         end
@@ -457,7 +459,7 @@ deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
         ?LOG_ERROR("OCPP error delivering message to ~ts: ~p:~p~n~p",
                    [ClientId, Class, Reason, Stacktrace]),
         {ok, QStates4, Actions4} = rabbit_queue_type:settle(
-            QName, discard, ?CONSUMER_TAG, [QMsgId], QStates0),
+            QName, discard, ConsumerTag, [QMsgId], QStates0),
         State5 = handle_queue_actions(Actions4, State#state{queue_states = QStates4}),
         deliver_to_client(Rest, AckRequired, State5)
     end.
@@ -554,7 +556,8 @@ bind_queue(State = #state{cfg = #cfg{queue_name = QName,
 
 %% Start consuming from the queue
 -spec consume_from_queue(state()) -> {ok, state()} | {error, term()}.
-consume_from_queue(State = #state{cfg = #cfg{queue_name = QName, client_id = ClientId, prefetch = Prefetch},
+consume_from_queue(State = #state{cfg = #cfg{queue_name = QName, client_id = ClientId,
+                                             prefetch = Prefetch, consumer_tag = ConsumerTag},
                                   queue_states = QStates0,
                                   auth_state = #auth_state{user = User, authz_ctx = AuthzCtx}}) ->
     %% Check read permission on the queue
@@ -567,7 +570,7 @@ consume_from_queue(State = #state{cfg = #cfg{queue_name = QName, client_id = Cli
                      limiter_pid => none, % Use basic prefetch
                      limiter_active => false,
                      mode => {simple_prefetch, Prefetch},
-                     consumer_tag => ?CONSUMER_TAG,
+                     consumer_tag => ConsumerTag,
                      exclusive_consume => true, % Allow other consumers? (Usually false for OCPP)
                      args => [],
                      ok_msg => undefined,
@@ -886,8 +889,6 @@ info(client_properties, #state{cfg = #cfg{client_id = ClientId,
 info(channel_max, _) -> 0;
 info(node, _) -> node();
 info(frame_max, _) -> 0; % Not applicable like MQTT
-%% SASL not supported?
-info(auth_mechanism, _) -> <<"BASIC">>;
 info(recv_oct, _) -> erlang:process_info(self(), message_queue_len); % Approx incoming? Needs better metric
 info(send_oct, _) -> 0; % Hard to track accurately here
 info(Other, #state{cfg=#cfg{client_id=ClientId}}) ->

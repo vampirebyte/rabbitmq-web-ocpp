@@ -111,6 +111,7 @@ end).
 -define(EVENT_KEYS,
         ?ITEMS ++
         [name,
+         client_id,
          client_properties,
          peer_cert_issuer,
          peer_cert_subject,

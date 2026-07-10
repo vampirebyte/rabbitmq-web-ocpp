@@ -9,13 +9,14 @@ define PROJECT_ENV
 	    {num_tcp_acceptors, 10},
 	    {num_ssl_acceptors, 10},
 	    {cowboy_opts, []},
-	    {proxy_protocol, false}
+	    {proxy_protocol, false},
+	    {allow_anonymous, false}
 	  ]
 endef
 
 LOCAL_DEPS = ssl
 DEPS = rabbit cowboy
-TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_management rabbitmq_stomp rabbitmq_consistent_hash_exchange
+TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_management rabbitmq_consistent_hash_exchange rabbitmq_event_exchange
 
 PLT_APPS += rabbitmqctl elixir cowlib
 
