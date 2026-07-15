@@ -618,9 +618,9 @@ i(reductions, _) ->
     Reductions;
 i(garbage_collection, _) ->
     rabbit_misc:get_gc_info(self());
-i(protocol, #state{proto_ver = ProtocolVer, socket = Sock}) ->
-    ProtocolName = case rabbit_net:is_ssl(Sock) of
-        true -> "WSS OCPP";
+i(protocol, #state{proto_ver = ProtocolVer} = State) ->
+    ProtocolName = case i(ssl, State) of
+        true  -> "WSS OCPP";
         false -> "WS OCPP"
     end,
     {ProtocolName, rabbit_web_ocpp_processor:proto_version_tuple(ProtocolVer)};

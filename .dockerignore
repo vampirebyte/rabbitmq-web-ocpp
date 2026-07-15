@@ -1,0 +1,10 @@
+.git
+.github
+ebin/
+rabbitmq_web_ocpp.d/
+_build/
+deps/
+plugins/
+dist/
+erl_crash.dump
+*.ez
