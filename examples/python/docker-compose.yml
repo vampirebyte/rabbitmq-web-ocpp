@@ -1,0 +1,44 @@
+name: python-ocpp-csms-example
+
+services:
+  rabbitmq:
+    image: ghcr.io/vampirebyte/rabbitmq-web-ocpp:4.3.1-ocpp
+    ports:
+      # AMQP
+      - "5672:5672"
+      # Management UI (guest/guest)
+      - "15672:15672"
+      # OCPP-over-WebSockets, connect EVSEs to ws://localhost:19520/ocpp/demo/
+      - "19520:19520"
+    configs:
+      - source: rabbitmq-conf
+        target: /etc/rabbitmq/conf.d/20-web-ocpp.conf
+    environment:
+      RABBITMQ_DEFAULT_USER: "guest"
+      RABBITMQ_DEFAULT_PASS: "guest"
+      RABBITMQ_DEFAULT_VHOST: "demo"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 10s
+
+  csms:
+    build: .
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      RABBITMQ_VHOST: demo
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+configs:
+  rabbitmq-conf:
+    content: |
+      # Let EVSEs connect without HTTP basic auth credentials.
+      web_ocpp.allow_anonymous = true
+

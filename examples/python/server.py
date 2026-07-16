@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 
 import aio_pika
@@ -66,11 +67,11 @@ async def main():
 
     try:
         connection = await aio_pika.connect_robust(
-            host='localhost',
-            port=5672,
-            virtualhost='/',
-            login='guest',
-            password='guest',
+            host=os.environ.get('RABBITMQ_HOST', 'localhost'),
+            port=int(os.environ.get('RABBITMQ_PORT', '5672')),
+            virtualhost=os.environ.get('RABBITMQ_VHOST', '/'),
+            login=os.environ.get('RABBITMQ_USER', 'guest'),
+            password=os.environ.get('RABBITMQ_PASS', 'guest'),
         )
 
         channel = await connection.channel()

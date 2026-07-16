@@ -35,6 +35,21 @@ RabbitMQ already excels at message durability and routing, but traditionally the
 ## Installation
 
 This plugin works only with modern versions of RabbitMQ 4.x based on AMQP 1.0.
+
+### Docker image
+
+The quickest way to get started is the prebuilt multi-arch (`amd64`/`arm64`) image, published to GitHub Container Registry on every push to `master`: [`ghcr.io/vampirebyte/rabbitmq-web-ocpp`](https://github.com/vampirebyte/rabbitmq-web-ocpp/pkgs/container/rabbitmq-web-ocpp). It is the official `rabbitmq:<version>-management` image with the plugin baked in and already enabled, so no further setup is required:
+
+``` bash
+docker run -it --rm --name rabbitmq-ocpp \
+    -p 5672:5672 -p 15672:15672 -p 19520:19520 \
+    ghcr.io/vampirebyte/rabbitmq-web-ocpp:4.3.1-ocpp
+```
+
+Tags follow the bundled RabbitMQ version (`4.3.1-ocpp`, `4.2.7-ocpp`, ...), plus a `-<short sha>` variant pinning the exact plugin commit.
+
+### Plugin archive (.ez)
+
 You can [build from source](https://www.rabbitmq.com/plugin-development.html) or you can download the latest release build from GitHub. Unzip and place the `rabbitmq_web_ocpp-4.x.x.ez` file into your `/etc/rabbitmq/plugins/` folder.
 Like all plugins, it [must be enabled](https://www.rabbitmq.com/plugins.html) before it can be used:
 
