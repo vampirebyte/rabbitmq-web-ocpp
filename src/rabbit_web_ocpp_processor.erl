@@ -35,6 +35,7 @@
 -define(CONSUMER_TAG_PREFIX, <<"ocpp.consumer.">>).
 -define(QUEUE_KIND, ocpp). % Used for queue naming convention
 -define(PREFETCH_COUNT, 1). % Default prefetch for the OCPP queue
+-define(MAX_ACTION_BYTES, 239). %% Room left for the Action string segment of the routing key
 
 %% --- Types ---
 
@@ -356,9 +357,12 @@ drain_frames(State = #state{pending_frames = Frames}) ->
 
 %% Terminate the processor
 -spec terminate(any(), rabbit_event:event_props(), state()) -> ok.
-terminate(Reason, Infos, _State = #state{queue_states = QStates,
+terminate(Reason, Infos, State = #state{queue_states = QStates,
                                         cfg = #cfg{client_id = ClientId}}) ->
     ?LOG_INFO("OCPP processor terminating. ClientId: ~ts, Reason: ~p", [ClientId, Reason]),
+    %% Whatever the reason for the disconnect, tell the backends the charge
+    %% point went offline with one final synthetic StatusNotification.
+    publish_offline_status(State),
     ok = rabbit_queue_type:close(QStates), % Stop consuming
     rabbit_core_metrics:connection_closed(self()),
     rabbit_event:notify(connection_closed, Infos),
@@ -366,6 +370,50 @@ terminate(Reason, Infos, _State = #state{queue_states = QStates,
     %% Note: We typically DO NOT delete the durable queue on disconnect for OCPP.
     %% It should persist messages while the CP is offline.
     ok.
+
+%% Publishes a synthetic StatusNotification CALL marking the whole
+%% charge point (connectorId 0) Unavailable/Offline, using the
+%% OCPP version schema the CP was originally connected with.
+-spec publish_offline_status(state()) -> ok.
+publish_offline_status(State = #state{cfg = #cfg{client_id = ClientId,
+                                                 proto_ver = ProtoVer}}) ->
+    MsgId = list_to_binary(rabbit_guid:to_string(rabbit_guid:gen())),
+    Timestamp = list_to_binary(
+                  calendar:system_time_to_rfc3339(os:system_time(second),
+                                                  [{offset, "Z"}])),
+    Payload = case proto_version_tuple(ProtoVer) of
+                  {1, _} -> % OCPP 1.x StatusNotification.req
+                      #{<<"connectorId">> => 0,
+                        <<"status">> => <<"Unavailable">>,
+                        <<"errorCode">> => <<"NoError">>,
+                        <<"timestamp">> => Timestamp,
+                        <<"vendorId">> => <<"rabbitmq">>,
+                        <<"vendorErrorCode">> => <<"Offline">>};
+                  _ -> % OCPP 2.x StatusNotificationRequest
+                      #{<<"timestamp">> => Timestamp,
+                        <<"connectorStatus">> => <<"Unavailable">>,
+                        <<"evseId">> => 0,
+                        <<"connectorId">> => 0,
+                        <<"customData">> => #{<<"vendorId">> => <<"rabbitmq">>,
+                                              <<"vendorErrorCode">> => <<"Offline">>}}
+              end,
+    Frame = iolist_to_binary(json:encode([?OCPP_MESSAGE_TYPE_CALL, MsgId,
+                                          <<"StatusNotification">>, Payload])),
+    McOcpp = #ocpp_msg{msg_type = ?OCPP_MESSAGE_TYPE_CALL,
+                       msg_id = MsgId,
+                       action = <<"StatusNotification">>,
+                       payload = Frame,
+                       client_id = ClientId},
+    try process_incoming(McOcpp, State) of
+        {ok, _} ->
+            ok;
+        {error, Err, _} ->
+            ?LOG_WARNING("OCPP offline StatusNotification for ClientId ~ts failed: ~p",
+                         [ClientId, Err])
+    catch Class:Err ->
+        ?LOG_WARNING("OCPP offline StatusNotification for ClientId ~ts failed: ~p:~p",
+                     [ClientId, Class, Err])
+    end.
 
 %% --- Internal Functions ---
 
@@ -377,13 +425,19 @@ generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action},
     %% Convert protocol version atom to binary string
     ProtoVerBin = atom_to_binary(ProtoVer, utf8),
 
-    %% Handle action name (may be undefined for responses)
+    %% Handle action name (may be undefined for responses). The Action is client input
+    %% with no restrictions in OCPP so we need to clean it up for routing key usage.
     ActionBin = case Action of
         undefined -> <<"response">>;  % For CALLRESULT/CALLERROR without action
-        ActionName when is_binary(ActionName) -> ActionName;
+        ActionName when is_binary(ActionName) ->
+            case re:replace(ActionName, "[^A-Za-z0-9]", "", [global, {return, binary}]) of
+                <<>> -> <<"unknown">>;
+                <<Trimmed:?MAX_ACTION_BYTES/binary, _/binary>> -> Trimmed;
+                Clean -> Clean
+            end;
         _ -> <<"unknown">>
     end,
-    
+
     %% Determine message direction (req/conf/error)
     MsgTypeBin = case MsgType of
         ?OCPP_MESSAGE_TYPE_CALL -> <<"req">>;      % Request from charge point
@@ -393,8 +447,8 @@ generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action},
         ?OCPP_MESSAGE_TYPE_CALLRESULTERROR -> <<"error">>; % Error in OCPP 2.1
         _ -> <<"unknown">>
     end,
-    
-    %% Construct routing key: ocpp.protocolver.actionname.req|conf|error
+
+    %% Construct routing key: ocpp<protocolver>.<actionname>.req|conf|error
     <<ProtoVerBin/binary, ".", ActionBin/binary, ".", MsgTypeBin/binary>>.
 
 %% @doc Extracts relevant metadata from a parsed OCPP message list.
@@ -536,7 +590,7 @@ bind_queue(State = #state{cfg = #cfg{queue_name = QName,
     RoutingKey = ClientId,
     Binding = #binding{source = ExchangeName, destination = QName,
                        key = RoutingKey, args = BindingArgs},
-    case check_binding_permitted(QName, ExchangeName, State) of
+    case check_binding_permitted(QName, ExchangeName, RoutingKey, State) of
         ok ->
             case rabbit_binding:add(Binding, User#user.username) of
                 ok ->
@@ -631,13 +685,18 @@ check_publish_permitted(Exchange, RoutingKey, State = #state{auth_state = AuthSt
         Err -> Err
     end.
 
-%% Check permissions for binding queue to exchange
-check_binding_permitted(QName, ExchangeName, #state{auth_state = AuthState}) ->
+%% Check permissions for binding queue to exchange. Requires 'write' on the
+%% queue, 'read' on the exchange, and topic 'read' on the binding key
+check_binding_permitted(QName, ExchangeName, RoutingKey,
+                        State = #state{auth_state = AuthState}) ->
     User = AuthState#auth_state.user,
     Ctx = AuthState#auth_state.authz_ctx,
-    %% Need 'write' on queue and 'read' on exchange for binding
     case check_resource_access(User, QName, write, Ctx) of
-        ok -> check_resource_access(User, ExchangeName, read, Ctx);
+        ok ->
+            case check_resource_access(User, ExchangeName, read, Ctx) of
+                ok -> check_topic_access(RoutingKey, read, State);
+                Err -> Err
+            end;
         Err -> Err
     end.
 

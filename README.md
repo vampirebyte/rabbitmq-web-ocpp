@@ -73,6 +73,26 @@ The communication flow is straightforward:
 5. Queues can be consumed by multiple identical, stateless workers written in any programming language. Monitor queues using built-in tools (e.g., Grafana) and configure auto-scaling based on message latency or queue depth.
 6. If a worker throws an exception before sending a valid OCPP response, standard AMQP ACK/NACK principles apply: unconfirmed messages return to the queue for processing by another worker. Handle failure scenarios (e.g., database outages) gracefully to avoid infinite retry loops.
 
+## Offline Detection
+
+Whenever an established charge point connection terminates — clean WebSocket close, TCP drop, crash or broker shutdown — the plugin publishes one final synthetic `StatusNotification` CALL on behalf of the charge point, so backend workers learn about the disconnect through the same channel as any other OCPP traffic. The payload marks the whole charge point (`connectorId` 0) unavailable, shaped for the protocol version the charge point was connected with:
+
+OCPP 1.x:
+
+```json
+[2,"40a2216a-4c22-37f8-28f2-92b7e6ba205e","StatusNotification",{"connectorId":0,"errorCode":"NoError","status":"Unavailable","timestamp":"2026-07-17T13:31:19Z","vendorErrorCode":"Offline","vendorId":"rabbitmq"}]
+```
+
+OCPP 2.x:
+
+```json
+[2,"83c2c788-712b-18a4-7456-29a4586ddb4a","StatusNotification",{"connectorId":0,"connectorStatus":"Unavailable","customData":{"vendorErrorCode":"Offline","vendorId":"rabbitmq"},"evseId":0,"timestamp":"2026-07-17T13:10:27Z"}]
+```
+
+Workers can recognize the synthetic frame by `vendorErrorCode` or `vendorId` — e.g. to skip sending the CALLRESULT, which would otherwise sit in the disconnected charge point's queue until it reconnects and be discarded because of an unknown `messageId`.
+
+Alternatively (or additionally — e.g. to also detect chargers coming *online* - if you don't do this by StatusNotification), enable the [`rabbitmq_event_exchange`](https://www.rabbitmq.com/docs/event-exchange) plugin and bind a queue to the internal `amq.rabbitmq.event` topic exchange for the `connection.created` and `connection.closed` routing keys. Connections handled by this plugin carry a `protocol` header of `{'WS OCPP', ...}` and a `client_id` header with the EVSE ID, so consumers can filter out non-OCPP connections (management UI, shovels, backend workers) and map events back to charge points.
+
 ## Documentation
 
 For all configuration options, please refer to the nearly identical plugin, [RabbitMQ Web MQTT guide](https://www.rabbitmq.com/web-mqtt.html).
