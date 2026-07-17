@@ -115,11 +115,7 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {Pe
             % Authz context might include ClientId specific info if needed by backends
             AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>},
             ok = register_client_id(Vhost, ClientId),
-            % Register potentially (optional, depends if needed for mgmt/tracking)
-            ok = rabbit_networking:register_non_amqp_connection(self()),
-            self() ! connection_created,
             rabbit_core_metrics:auth_attempt_succeeded(PeerIp, ClientId, ocpp),
-            rabbit_global_counters:consumer_created(ProtoVer),
 
             %% 3. Setup Resources
             ExchangeNameBin = application:get_env(rabbit_web_ocpp, exchange, ?DEFAULT_EXCHANGE_NAME),
@@ -155,14 +151,18 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {Pe
             {ok, StateAfterQueue} ?= ensure_queue_and_binding(InitialState),
             {ok, FinalState} ?= consume_from_queue(StateAfterQueue),
 
+            %% Register the connection and let the handler emit connection_created
+            %% only now that the connection is fully established (consume_from_queue succeeded).
+            ok = rabbit_networking:register_non_amqp_connection(self()),
+            rabbit_global_counters:consumer_created(ProtoVer),
+            self() ! connection_created,
+
             ?LOG_INFO("OCPP connection ~ts established for ClientId ~ts on vhost ~ts",
                       [ConnName0, ClientId, Vhost]),
             {ok, FinalState}
         else
             {error, Reason} ->
                 ?LOG_ERROR("OCPP connection failed for ClientId ~ts: ~p", [ClientId, Reason]),
-                %% Cleanup if partially successful before error
-                rabbit_networking:unregister_non_amqp_connection(self()),
                 {error, Reason} % Return the error reason
         end,
     Result.
