@@ -274,7 +274,11 @@ websocket_info({Ref, join, _PgGroup, Pids},
             %% installed before the group is joined.
             {[], State, hibernate};
         _ ->
-            ?LOG_WARNING("Web OCPP disconnecting a client with duplicate ID '~s' (~p)",
+            %% Safety net for a lost direct {duplicate_id} kick (e.g. after
+            %% a network partition heals): usually the kick arrives first
+            %% and this connection is already closing.
+            ?LOG_DEBUG("Web OCPP observed the join of a newer connection with "
+                       "the same client ID '~s', closing (~p)",
                  [ClientId, ConnName]),
             defer_close(?CLOSE_NORMAL),
             {[], State}

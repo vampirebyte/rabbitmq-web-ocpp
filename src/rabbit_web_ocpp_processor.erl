@@ -32,9 +32,10 @@
 %% --- Constants ---
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
 -define(DEFAULT_EXCHANGE_NAME, <<"amq.topic">>). % Example exchange name
--define(CONSUMER_TAG_PREFIX, <<"ocpp.consumer.">>).
+-define(CONSUMER_TAG_PREFIX, <<"ocpp.ctag-">>).
 -define(QUEUE_KIND, ocpp). % Used for queue naming convention
 -define(PREFETCH_COUNT, 1). % Default prefetch for the OCPP queue
+-define(DUPLICATE_ID_KICK_TIMEOUT_MS, 3000). %% Wait for a kicked duplicate client ID to terminate.
 -define(MAX_ACTION_BYTES, 239). %% Room left for the Action string segment of the routing key
 
 %% --- Types ---
@@ -221,29 +222,6 @@ process_incoming(McOcpp = #ocpp_msg{},
             {error, Error, State}
     end.
 
-% publish_to_queues(
-%   #mqtt_msg{topic = Topic,
-%             packet_id = PacketId} = MqttMsg,
-%   #state{cfg = #cfg{exchange = ExchangeName = #resource{name = ExchangeNameBin},
-%                     conn_name = ConnName,
-%                     trace_state = TraceState},
-%          auth_state = #auth_state{user = #user{username = Username}}} = State) ->
-%     Anns = #{?ANN_EXCHANGE => ExchangeNameBin,
-%              ?ANN_ROUTING_KEYS => [mqtt_to_amqp(Topic)]},
-%     Msg0 = mc:init(mc_mqtt, MqttMsg, Anns, mc_env()),
-%     Msg = rabbit_message_interceptor:intercept(Msg0),
-%     case rabbit_exchange:lookup(ExchangeName) of
-%         {ok, Exchange} ->
-%             QNames0 = rabbit_exchange:route(Exchange, Msg, #{return_binding_keys => true}),
-%             QNames = drop_local(QNames0, State),
-%             rabbit_trace:tap_in(Msg, QNames, ConnName, Username, TraceState),
-%             Opts = maps_put_truthy(flow, Flow, maps_put_truthy(correlation, PacketId, #{})),
-%             deliver_to_queues(Msg, Opts, QNames, State);
-%         {error, not_found} ->
-%             ?LOG_ERROR("~s not found", [rabbit_misc:rs(ExchangeName)]),
-%             {error, exchange_not_found, State}
-%     end.
-
 deliver_to_queues(Message,
                   Options,
                   RoutedToQNames,
@@ -289,8 +267,8 @@ lookup_queue_targets(QNames) ->
 register_client_id(Vhost, ClientId)
   when is_binary(Vhost), is_binary(ClientId) ->
     PgGroup = {Vhost, ClientId},
-    PgScope = persistent_term:get(?PG_SCOPE),
-    %% "Last connection wins" without any per-connect cluster-wide calls:
+    %% "Last connection wins" without any per-connect cluster-wide calls,
+    %% relying on the shared pg scope replicating memberships to all nodes:
     %%
     %% The monitor is installed *before* joining, so the event stream is
     %% complete: a member never sees joins that happened before its own
@@ -299,16 +277,32 @@ register_client_id(Vhost, ClientId)
     %% websocket_info clauses in rabbit_web_ocpp_handler). This also
     %% converges after a network partition heals, when pg re-syncs
     %% memberships, something an erpc broadcast at connect time misses.
-    {_Ref, Members} = pg:monitor(PgScope, PgGroup),
-    ok = pg:join(PgScope, PgGroup, self()),
-    %% Disconnect the already-known members directly rather than
-    %% waiting for them to observe our join.
-    _ = [gen_server:cast(Pid, {duplicate_id}) || Pid <- Members, Pid =/= self()],
-    ok.
+    {_Ref, Members} = pg:monitor(?PG_SCOPE, PgGroup),
+    ok = pg:join(?PG_SCOPE, PgGroup, self()),
+    %% Disconnect the already-known members and wait for them to die.
+    %% A 'DOWN' fires only after the old connection fully terminated, i.e.
+    %% after it published its final offline status and its exit released
+    %% the exclusive consumer, so this connection is ready to bind, consume
+    %% and announce itself the moment the monitor fires.
+    lists:foreach(fun(Pid) ->
+                          MRef = erlang:monitor(process, Pid),
+                          gen_server:cast(Pid, {duplicate_id}),
+                          receive
+                              {'DOWN', MRef, process, Pid, _} -> ok
+                          after ?DUPLICATE_ID_KICK_TIMEOUT_MS ->
+                              erlang:demonitor(MRef, [flush]),
+                              ?LOG_WARNING("Web OCPP connection ~p with duplicate "
+                                           "client ID did not terminate in ~bms",
+                                           [Pid, ?DUPLICATE_ID_KICK_TIMEOUT_MS])
+                          end
+                  end, Members -- [self()]).
 
 -spec consumer_tag(pos_integer()) -> binary().
 consumer_tag(ConnectedAt) ->
-    <<?CONSUMER_TAG_PREFIX/binary, (integer_to_binary(ConnectedAt))/binary>>.
+    %% The unique integer disambiguates same-millisecond reconnects.
+    Unique = erlang:unique_integer([positive]),
+    <<?CONSUMER_TAG_PREFIX/binary, (integer_to_binary(ConnectedAt))/binary,
+      ".", (integer_to_binary(Unique))/binary>>.
 
 %% Handle internal messages, queue events, etc.
 -spec handle_info(term(), state()) -> {ok, state(), cowboy_websocket:commands()} | {stop, term(), state()}.
@@ -361,7 +355,10 @@ terminate(Reason, Infos, State = #state{queue_states = QStates,
                                         cfg = #cfg{client_id = ClientId}}) ->
     ?LOG_INFO("OCPP processor terminating. ClientId: ~ts, Reason: ~p", [ClientId, Reason]),
     %% Whatever the reason for the disconnect, tell the backends the charge
-    %% point went offline with one final synthetic StatusNotification.
+    %% point went offline with one final synthetic StatusNotification. On a
+    %% duplicate client ID kick this runs before the new connection
+    %% proceeds (see register_client_id/2), so the subsequent online status
+    %% is never overtaken by this one.
     publish_offline_status(State),
     ok = rabbit_queue_type:close(QStates), % Stop consuming
     rabbit_core_metrics:connection_closed(self()),
@@ -561,7 +558,7 @@ ensure_queue_and_binding(State = #state{cfg = #cfg{queue_name = QName,
                         {new, _Queue} -> % Successfully declared
                             rabbit_core_metrics:queue_created(QName),
                             bind_queue(State); % Proceed to binding
-                        {existing, _ExistingQInfo} -> % Queue already exists (Corrected pattern)
+                        {existing, _ExistingQ} -> % Queue already exists
                             ?LOG_DEBUG("OCPP queue ~ts already exists, proceeding to bind.", [rabbit_misc:rs(QName)]),
                             bind_queue(State); % Proceed to binding
                         {error, queue_limit_exceeded, Reason, ReasonArgs} ->
@@ -571,13 +568,13 @@ ensure_queue_and_binding(State = #state{cfg = #cfg{queue_name = QName,
                             ?LOG_ERROR("Failed to declare OCPP queue ~s: ~p", [rabbit_misc:rs(QName), Other]),
                             {error, {queue_declare_failed, queue_declare_error}}
                     end;
-                {error, access_refused} = DlxErr -> % DLX permission failed
+                {error, access_refused} -> % DLX permission failed
                     ?LOG_WARNING("OCPP DLX permission refused for queue ~ts", [rabbit_misc:rs(QName)]),
-                    DlxErr
+                    {error, {queue_declare_failed, access_refused}}
             end; % End of DLX check case
-        {error, access_refused} = ConfigureErr ->
+        {error, access_refused} ->
             ?LOG_WARNING("OCPP configure permission refused for queue ~ts", [rabbit_misc:rs(QName)]),
-            ConfigureErr % Return configure permission error
+            {error, {queue_declare_failed, access_refused}}
     end.
 
 %% Helper function for binding logic
@@ -602,10 +599,10 @@ bind_queue(State = #state{cfg = #cfg{queue_name = QName,
                               [rabbit_misc:rs(QName), rabbit_misc:rs(ExchangeName), Reason]),
                     {error, {binding_failed, Reason}}
             end;
-        {error, access_refused} = Error ->
+        {error, access_refused} ->
             ?LOG_WARNING("OCPP binding permission refused for queue ~ts / exchange ~ts",
                          [rabbit_misc:rs(QName), rabbit_misc:rs(ExchangeName)]),
-            {error, Error}
+            {error, {binding_failed, access_refused}}
     end.
 
 %% Start consuming from the queue
@@ -625,11 +622,11 @@ consume_from_queue(State = #state{cfg = #cfg{queue_name = QName, client_id = Cli
                      limiter_active => false,
                      mode => {simple_prefetch, Prefetch},
                      consumer_tag => ConsumerTag,
-                     exclusive_consume => true, % Allow other consumers? (Usually false for OCPP)
+                     exclusive_consume => true, % Allow other consumers? (false for OCPP)
                      args => [],
                      ok_msg => undefined,
                      acting_user => User#user.username},
-            
+
             %% Use rabbit_amqqueue:with to handle potential queue lookup races/errors
             rabbit_amqqueue:with(
                 QName,
@@ -646,22 +643,23 @@ consume_from_queue(State = #state{cfg = #cfg{queue_name = QName, client_id = Cli
                                     ?LOG_INFO("OCPP successfully started consuming from ~ts with prefetch ~p for ClientId ~ts",
                                              [rabbit_misc:rs(QName), Prefetch, ClientId]),
                                     {ok, State#state{queue_states = QStates}};
-                                {error, Reason} = Err ->
-                                    ?LOG_ERROR("OCPP failed to consume from ~ts for ClientId ~ts: ~p",
-                                             [rabbit_misc:rs(QName), ClientId, Reason]),
-                                    Err
+                                {error, Type, Fmt, FmtArgs} ->
+                                    ?LOG_ERROR("OCPP failed to consume from ~ts for ClientId ~ts: ~ts",
+                                             [rabbit_misc:rs(QName), ClientId,
+                                              rabbit_misc:format(Fmt, FmtArgs)]),
+                                    {error, {consume_failed, Type}}
                             end
                     end
                 end,
                 fun(ErrorType) -> % Handle case where queue doesn't exist during consume
                     ?LOG_ERROR("OCPP cannot consume, queue ~ts lookup failed for ClientId ~ts: ~p",
                              [rabbit_misc:rs(QName), ClientId, ErrorType]),
-                    {error, {consume_failed, queue_lookup_failed, ErrorType}}
+                    {error, {consume_failed, ErrorType}}
                 end);
-        {error, access_refused} = Error ->
+        {error, access_refused} ->
             ?LOG_WARNING("OCPP consume permission refused for queue ~ts for ClientId ~ts",
                        [rabbit_misc:rs(QName), ClientId]),
-            {error, Error}
+            {error, {consume_failed, access_refused}}
     end.
 
 %% Check if this process is already consuming from the queue

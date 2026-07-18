@@ -49,15 +49,13 @@ stop(_State) ->
     ok.
 
 init([]) ->
-    %% Use separate process group scope per RabbitMQ node. This achieves a local-only
-    %% process group which requires less memory with millions of connections.
-    PgScope = rabbit:pg_local_scope(?PG_SCOPE),
-    persistent_term:put(?PG_SCOPE, PgScope),
-
-    %% Define the children for the supervision tree
+    %% Use a single, cluster-wide process group scope: pg scopes registered
+    %% under the same name discover each other and replicate memberships
+    %% across nodes, which register_client_id/2 relies on to detect and
+    %% disconnect duplicate client IDs anywhere in the cluster.
     Children = [
-        #{id => PgScope,
-          start => {pg, start_link, [PgScope]},
+        #{id => ?PG_SCOPE,
+          start => {pg, start_link, [?PG_SCOPE]},
           restart => transient,
           shutdown => ?WORKER_WAIT,
           type => worker,
