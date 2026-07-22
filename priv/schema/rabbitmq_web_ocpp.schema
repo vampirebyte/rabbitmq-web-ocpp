@@ -169,6 +169,14 @@ end}.
     end
 }.
 
+%% Whether to offer permessage-deflate websocket compression to clients
+%% that request it. Disabled by default: each compressed connection holds
+%% two zlib contexts for its lifetime. When enabled, tuned deflate
+%% parameters are applied automatically (~30 kB per connection instead of
+%% ~300 kB with zlib defaults); see DEFAULT_DEFLATE_OPTS.
+%%
+%% {compress, false}
+
 {mapping, "web_ocpp.ws_opts.compress", "rabbitmq_web_ocpp.cowboy_ws_opts.compress",
     [{datatype, {enum, [true, false]}}]
 }.
@@ -195,6 +203,23 @@ end}.
 
 {mapping, "web_ocpp.allow_anonymous", "rabbitmq_web_ocpp.allow_anonymous",
     [{datatype, {enum, [true, false]}}]}.
+
+%% Exchange that inbound OCPP messages are published to, and that each
+%% per-station queue (ocpp.<client_id>) is bound to. Must be a topic
+%% exchange existing in every vhost stations connect to.
+%%
+%% {exchange, "amq.topic"}
+
+{mapping, "web_ocpp.exchange", "rabbitmq_web_ocpp.exchange",
+    [{datatype, string}]}.
+
+%% Maximum number of unacknowledged messages delivered concurrently from a
+%% station's queue down its websocket.
+%%
+%% {prefetch_count, 1}
+
+{mapping, "web_ocpp.prefetch_count", "rabbitmq_web_ocpp.prefetch_count",
+    [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
 
 %%
 %% File Handle Cache

@@ -119,10 +119,11 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {Pe
             rabbit_core_metrics:auth_attempt_succeeded(PeerIp, ClientId, ocpp),
 
             %% 3. Setup Resources
-            ExchangeNameBin = application:get_env(rabbit_web_ocpp, exchange, ?DEFAULT_EXCHANGE_NAME),
+            ExchangeNameBin = rabbit_data_coercion:to_binary(
+                                application:get_env(?APP_NAME, exchange, ?DEFAULT_EXCHANGE_NAME)),
             ExchangeName = rabbit_misc:r(Vhost, exchange, ExchangeNameBin),
             QueueName = queue_name(Vhost, ClientId),
-            Prefetch = application:get_env(rabbit_web_ocpp, prefetch_count, ?PREFETCH_COUNT),
+            Prefetch = application:get_env(?APP_NAME, prefetch_count, ?PREFETCH_COUNT),
             {TraceState, ConnName} = init_trace(Vhost, ConnName0),
             ConnectedAt = os:system_time(millisecond),
 

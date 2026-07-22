@@ -112,7 +112,17 @@ init(Req, Opts) ->
                     ProxyInfo   = maps:get(proxy_header, Req2, undefined),
                     WsOpts0     = proplists:get_value(ws_opts, Opts, #{}),
                     IdleMs      = maps:get(idle_timeout, WsOpts0, ?DEFAULT_IDLE_TIMEOUT_MS),
-                    WsOpts      = maps:merge(#{compress => true, idle_timeout => IdleMs}, WsOpts0),
+                    %% Compression is opt-in (web_ocpp.ws_opts.compress): each
+                    %% permessage-deflate connection holds two zlib contexts for
+                    %% its whole lifetime. When enabled, ?DEFAULT_DEFLATE_OPTS is
+                    %% applied unless the operator supplies deflate_opts.
+                    WsOpts1     = maps:merge(#{compress => false, idle_timeout => IdleMs}, WsOpts0),
+                    WsOpts      = case WsOpts1 of
+                                      #{compress := true} ->
+                                          maps:merge(#{deflate_opts => ?DEFAULT_DEFLATE_OPTS}, WsOpts1);
+                                      _ ->
+                                          WsOpts1
+                                  end,
                     IdleSec     = case IdleMs of infinity -> 0; Ms -> Ms div 1000 end,
                     State = #state{socket = ProxyInfo, proto_ver = ProtocolVer, vhost = V2,
                                    user = User, client_id = CId, idle_timeout = IdleSec,

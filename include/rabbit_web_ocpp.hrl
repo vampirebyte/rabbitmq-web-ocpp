@@ -7,7 +7,19 @@
 
 -define(APP_NAME, rabbitmq_web_ocpp).
 -define(PG_SCOPE, pg_scope_rabbitmq_web_ocpp_clientid).
--define(DEFAULT_IDLE_TIMEOUT_MS, 600_000). %% 10 minutes
+-define(DEFAULT_IDLE_TIMEOUT_MS, 60_000). %% 1 minute
+
+%% Default zlib parameters applied when websocket compression is enabled.
+%% Bounds permessage-deflate memory to ~30 kB per connection (deflate:
+%% 2^(11+2) + 2^(4+9) bytes; inflate: 2^11 bytes; plus zlib struct
+%% overhead) instead of ~300 kB with the zlib defaults (window_bits 15,
+%% mem_level 8, level best_compression). Context takeover stays enabled,
+%% which preserves most of the compression ratio for small, repetitive
+%% OCPP JSON frames.
+-define(DEFAULT_DEFLATE_OPTS, #{level => 1,
+                                mem_level => 4,
+                                server_max_window_bits => 11,
+                                client_max_window_bits => 11}).
 
 -type option(T) :: undefined | T.
 -type client_id() :: binary().
