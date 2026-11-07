@@ -36,16 +36,28 @@
 start(_Type, _StartArgs) ->
     init_global_counters(),
     ocpp_init(),
-    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+    Result = supervisor:start_link({local, ?MODULE}, ?MODULE, []),
+    EMPid = case rabbit_event:start_link() of
+                {ok, Pid}                       -> Pid;
+                {error, {already_started, Pid}} -> Pid
+            end,
+    ok = gen_event:add_handler(EMPid, rabbit_web_ocpp_internal_event_handler, []),
+    Result.
 
+%% Listeners and their connections are stopped before the supervision tree,
+%% because connections depend on the client ID process group scope it owns.
+%% Connections still open, for example when the node is stopped without a
+%% prior drain, are first given the maintenance close window to go away.
 -spec prep_stop(term()) -> term().
 prep_stop(State) ->
+    _ = gen_event:delete_handler(rabbit_event, rabbit_web_ocpp_internal_event_handler, []),
+    ok = rabbit_web_ocpp_internal_event_handler:close_local_connections_and_wait(),
+    rabbit_networking:stop_ranch_listeners_of_protocol(?OCPP_TCP_PROTOCOL),
+    rabbit_networking:stop_ranch_listeners_of_protocol(?OCPP_TLS_PROTOCOL),
     State.
 
 -spec stop(_) -> ok.
 stop(_State) ->
-    _ = rabbit_networking:stop_ranch_listener_of_protocol(?OCPP_TCP_PROTOCOL),
-    _ = rabbit_networking:stop_ranch_listener_of_protocol(?OCPP_TLS_PROTOCOL),
     ok.
 
 init([]) ->
