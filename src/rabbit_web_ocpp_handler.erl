@@ -455,10 +455,10 @@ check_credentials(ClientId, Username, Password, SslLoginName, PeerIp) ->
     case creds(ClientId, Username, Password, SslLoginName) of
         {ok, _, _} = Ok ->
             Ok;
-        {invalid_cert_creds, CertLoginName} ->
-            ?LOG_ERROR("OCPP TLS client certificate identity '~s' does not match client ID '~s'",
-                       [CertLoginName, ClientId]),
-            auth_attempt_failed(PeerIp, CertLoginName),
+        {client_id_mismatch, LoginName} ->
+            ?LOG_ERROR("OCPP login identity '~s' does not match client ID '~s'",
+                       [LoginName, ClientId]),
+            auth_attempt_failed(PeerIp, LoginName),
             {error, ?CLOSE_POLICY_VIOLATION};
         nocreds ->
             ?LOG_ERROR("OCPP login failed: no credentials provided"),
@@ -490,9 +490,13 @@ creds(ClientId, User, Pass, SSLLoginName) ->
         {_, _, true} when SSLLoginName =:= ClientId ->
             {ok, SSLLoginName, none};
         {_, _, true} ->
-            {invalid_cert_creds, SSLLoginName};
-        {true, true, false} ->
+            {client_id_mismatch, SSLLoginName};
+        %% Security Profiles 1 and 2 use the charge point identity as the
+        %% Basic auth username, so it must match the client ID as well.
+        {true, true, false} when User =:= ClientId ->
             {ok, User, Pass};
+        {true, true, false} ->
+            {client_id_mismatch, User};
         {true, false, false} ->
             %% Either username or password is provided
             {invalid_creds, {User, Pass}};
