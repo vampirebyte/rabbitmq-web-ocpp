@@ -206,8 +206,7 @@ process_incoming(McOcpp = #ocpp_msg{},
                             rabbit_trace:tap_in(McMsg, QNames, ConnName, Username, TraceState),
                             ?LOG_DEBUG("OCPP message routed to ~p queues for ClientId ~ts: ~p",
                                         [length(QNames), ClientId, QNames]),
-                            deliver_to_queues(McMsg, #{}, QNames, State),
-                            {ok, State};
+                            {ok, deliver_to_queues(McMsg, #{}, QNames, State)};
                         {error, Reason} ->
                             ?LOG_ERROR("OCPP failed to route message via exchange ~ts: ~p",
                                         [rabbit_misc:rs(ExchangeName), Reason]),
@@ -232,18 +231,18 @@ deliver_to_queues(Message,
     Qs = rabbit_amqqueue:prepend_extra_bcc(Qs0),
     ?LOG_DEBUG("Delivering to queue ~p with state ~p", [Qs, QStates0]),
     case rabbit_queue_type:deliver(Qs, Message, Options, QStates0) of
-        {ok, _QStates, Actions} ->
+        {ok, QStates, Actions} ->
             rabbit_global_counters:messages_routed(ProtoVer, length(Qs)),
             % State = process_routing_confirm(Options, Qs,
             %                                 State0#state{queue_states = QStates}),
             %% Actions must be processed after registering confirms as actions may
             %% contain rejections of publishes.
-            {ok, handle_queue_actions(Actions, State0)};
+            handle_queue_actions(Actions, State0#state{queue_states = QStates});
         {error, Reason} ->
             Corr = maps:get(correlation, Options, undefined),
             ?LOG_ERROR("Failed to deliver message with packet_id=~p to queues: ~p",
                        [Corr, Reason]),
-            {error, Reason, State0}
+            State0
     end.
 
 %% OCPP Messages MUST NOT be forwarded to a connection with a ClientID
@@ -322,18 +321,23 @@ handle_info({queue_event, QName, Evt}, State = #state{queue_states = QStates0}) 
              drain_frames(State)
     end;
 
-handle_info({'DOWN', _, process, Pid, Reason}, State = #state{queue_states = QStates0}) ->
-    %% Handle queue process down event
-    case rabbit_queue_type:handle_down(Pid, undefined, Reason, QStates0) of
-         {ok, QStates1, Actions} ->
+%% The consumer cannot be re-established on a queue that is down, so close
+%% the connection and let the charge point reconnect and consume again.
+handle_info({{'DOWN', QName}, _, process, Pid, Reason},
+            State = #state{cfg = #cfg{queue_name = QName, client_id = ClientId}}) ->
+    ?LOG_WARNING("OCPP queue ~ts consumed by ClientId ~ts went down (~p): ~p",
+                 [rabbit_misc:rs(QName), ClientId, Pid, Reason]),
+    {stop, {shutdown, consumed_queue_down}, State};
+handle_info({{'DOWN', QName}, _, process, Pid, Reason}, State = #state{queue_states = QStates0}) ->
+    case rabbit_queue_type:handle_down(Pid, QName, Reason, QStates0) of
+        {ok, QStates1, Actions} ->
             State1 = State#state{queue_states = QStates1},
             drain_frames(handle_queue_actions(Actions, State1));
-         {eol, QStates1, _QRef} -> % Queue is gone
-             ?LOG_WARNING("OCPP queue process ~p down, queue is gone (EOL)", [Pid]),
-             drain_frames(State#state{queue_states = QStates1});
-         _ ->
-             ?LOG_WARNING("OCPP queue process ~p down, reason: ~p", [Pid, Reason]),
-             drain_frames(State)
+        {eol, QStates1, QRef} ->
+            QStates = rabbit_queue_type:remove(QRef, QStates1),
+            drain_frames(State#state{queue_states = QStates});
+        _ ->
+            drain_frames(State)
     end;
 
 handle_info(connection_closed, State) -> % Message from RabbitMQ core if underlying socket closes
@@ -509,9 +513,15 @@ deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
     catch Class:Reason:Stacktrace ->
         ?LOG_ERROR("OCPP error delivering message to ~ts: ~p:~p~n~p",
                    [ClientId, Class, Reason, Stacktrace]),
-        {ok, QStates4, Actions4} = rabbit_queue_type:settle(
-            QName, discard, ConsumerTag, [QMsgId], QStates0),
-        State5 = handle_queue_actions(Actions4, State#state{queue_states = QStates4}),
+        State5 = case rabbit_queue_type:settle(
+                        QName, discard, ConsumerTag, [QMsgId], QStates0) of
+                     {ok, QStates4, Actions4} ->
+                         handle_queue_actions(Actions4, State#state{queue_states = QStates4});
+                     SettleErr ->
+                         ?LOG_ERROR("OCPP failed to discard message for ~ts: ~p",
+                                    [ClientId, SettleErr]),
+                         State
+                 end,
         deliver_to_client(Rest, AckRequired, State5)
     end.
 

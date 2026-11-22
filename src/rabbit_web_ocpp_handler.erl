@@ -261,17 +261,10 @@ websocket_info({stop, CloseCode, Error}, State) ->
     stop(State, CloseCode, Error);
 websocket_info({'EXIT', _, _}, State) ->
     stop(State);
-websocket_info({'$gen_cast', QueueEvent = {queue_event, _, _}},
-               State = #state{proc_state = PState0}) ->
-    case rabbit_web_ocpp_processor:handle_info(QueueEvent, PState0) of
-        {ok, PState, Frames} ->
-            NewState = State#state{proc_state = PState},
-            {Frames, NewState, hibernate};
-        {error, Reason, PState} ->
-            ?LOG_ERROR("Web OCPP connection ~p failed to handle queue event: ~p",
-                       [State#state.conn_name, Reason]),
-            stop(State#state{proc_state = PState})
-    end;
+websocket_info({'$gen_cast', QueueEvent = {queue_event, _, _}}, State) ->
+    handle_queue_info(QueueEvent, State);
+websocket_info({{'DOWN', _QName}, _MRef, process, _Pid, _Reason} = QueueDown, State) ->
+    handle_queue_info(QueueDown, State);
 websocket_info({'$gen_cast', {duplicate_id}},
                State = #state{client_id = ClientId,
                               conn_name = ConnName}) ->
@@ -334,9 +327,6 @@ websocket_info(credential_expired,
     {[], State};
 websocket_info(emit_stats, State) ->
     {[], emit_stats(State), hibernate};
-websocket_info({{'DOWN', _QName}, _MRef, process, _Pid, _Reason} = _Evt,
-               State = #state{}) ->
-    {[], State};
 websocket_info({'DOWN', _MRef, process, QPid, _Reason}, State) ->
     rabbit_amqqueue_common:notify_sent_queue_down(QPid),
     {[], State, hibernate};
@@ -380,6 +370,20 @@ terminate(Reason, _Request, Opts) ->
     ok.
 
 %% Internal.
+
+handle_queue_info(QueueInfo, State = #state{proc_state = PState0}) ->
+    case rabbit_web_ocpp_processor:handle_info(QueueInfo, PState0) of
+        {ok, PState, Frames} ->
+            NewState = State#state{proc_state = PState},
+            {Frames, NewState, hibernate};
+        %% Already logged by the processor.
+        {stop, {shutdown, consumed_queue_down}, PState} ->
+            stop(State#state{proc_state = PState}, ?CLOSE_SERVER_GOING_DOWN, consumed_queue_down);
+        {stop, Reason, PState} ->
+            ?LOG_ERROR("Web OCPP connection ~p failed to handle queue event: ~p",
+                       [State#state.conn_name, Reason]),
+            stop(State#state{proc_state = PState})
+    end.
 
 %% Authentication mechanism shown in the management UI. Mirrors the
 %% decision taken by creds/4: a validated client certificate takes
