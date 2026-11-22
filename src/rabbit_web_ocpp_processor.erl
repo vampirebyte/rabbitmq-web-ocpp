@@ -629,7 +629,12 @@ bind_queue(State = #state{cfg = #cfg{queue_name = QName,
                        key = RoutingKey, args = BindingArgs},
     case check_binding_permitted(QName, ExchangeName, RoutingKey, State) of
         ok ->
-            case rabbit_binding:add(Binding, User#user.username) of
+            %% Adding an existing binding would still write to the metadata store.
+            Result = case rabbit_binding:exists(Binding) of
+                         true -> ok;
+                         _ -> rabbit_binding:add(Binding, User#user.username)
+                     end,
+            case Result of
                 ok ->
                     ?LOG_DEBUG("OCPP queue ~ts bound to ~ts with key ~ts",
                               [rabbit_misc:rs(QName), rabbit_misc:rs(ExchangeName), RoutingKey]),
