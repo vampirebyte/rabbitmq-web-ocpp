@@ -170,7 +170,8 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, Se
     Result.
 
 %% Process incoming OCPP message (parsed list + raw binary)
--spec process_incoming(McOcpp :: #ocpp_msg{}, state()) -> {ok, state()} | {error, term(), state()}.
+-spec process_incoming(McOcpp :: #ocpp_msg{}, state()) ->
+    {ok, state(), [cowboy_websocket:frame()]} | {error, term(), state()}.
 process_incoming(McOcpp = #ocpp_msg{},
                 State = #state{cfg = #cfg{exchange = ExchangeName = #resource{name = ExchangeNameBin},
                                                     client_id = ClientId,
@@ -203,13 +204,13 @@ process_incoming(McOcpp = #ocpp_msg{},
                                         "Exchange: ~ts, routing key: ~ts",
                                         [ClientId, rabbit_misc:rs(ExchangeName), RoutingKey]),
                             rabbit_global_counters:messages_unroutable_dropped(ProtoVer, 1),
-                            {ok, State};
+                            drain_frames(reply_unroutable(McOcpp, State));
                         QNames when is_list(QNames) ->
                             %% 6. Trace (optional)
                             rabbit_trace:tap_in(McMsg, QNames, ConnName, Username, TraceState),
                             ?LOG_DEBUG("OCPP message routed to ~p queues for ClientId ~ts: ~p",
                                         [length(QNames), ClientId, QNames]),
-                            {ok, deliver_to_queues(McMsg, #{}, QNames, State)};
+                            drain_frames(deliver_to_queues(McMsg, #{}, QNames, State));
                         {error, Reason} ->
                             ?LOG_ERROR("OCPP failed to route message via exchange ~ts: ~p",
                                         [rabbit_misc:rs(ExchangeName), Reason]),
@@ -223,6 +224,17 @@ process_incoming(McOcpp = #ocpp_msg{},
             ?LOG_WARNING("OCPP publish refused for ClientId ~ts to exchange ~ts", [ClientId, rabbit_misc:rs(ExchangeName)]),
             {error, access_refused, State}
     end.
+
+%% Answers a CALL that no queue is bound for, so that the charge point does
+%% not wait for its timeout.
+reply_unroutable(#ocpp_msg{msg_type = ?OCPP_MESSAGE_TYPE_CALL, msg_id = MsgId,
+                           action = Action}, State)
+  when is_binary(Action) ->
+    CallError = [?OCPP_MESSAGE_TYPE_CALLERROR, MsgId, <<"NotImplemented">>,
+                 <<"No handler for action ", Action/binary>>, #{}],
+    buffer_frame({text, iolist_to_binary(json:encode(CallError))}, State);
+reply_unroutable(_, State) ->
+    State.
 
 deliver_to_queues(Message,
                   Options,
@@ -412,7 +424,7 @@ publish_offline_status(State = #state{cfg = #cfg{client_id = ClientId,
                        payload = Frame,
                        client_id = ClientId},
     try process_incoming(McOcpp, State) of
-        {ok, _} ->
+        {ok, _, _} ->
             ok;
         {error, Err, _} ->
             ?LOG_WARNING("OCPP offline StatusNotification for ClientId ~ts failed: ~p",

@@ -209,12 +209,11 @@ websocket_handle({text, Data}, State = #state{conn_name = ConnName, client_id = 
             % Decoding and validation successful, now process the incoming message
             % Pass both the decoded list and the original raw binary
             case rabbit_web_ocpp_processor:process_incoming(McOcpp, ProcState1) of
-                {ok, NewProcState} ->
-                    % Message successfully published to the exchange
+                {ok, NewProcState, Frames} ->
                     ?LOG_DEBUG("Web OCPP message processed and published for ~p (~p)",
                                [ClientId, ConnName]),
                     NewState = State#state{proc_state = NewProcState},
-                    {[], ensure_stats_timer(NewState), hibernate};
+                    {Frames, ensure_stats_timer(NewState), hibernate};
                 {error, Reason, _ProcState} ->
                     % Publish permission denied or other processing error
                     ?LOG_ERROR("OCPP message processing failed for ~p (~p). Reason: ~tp",
