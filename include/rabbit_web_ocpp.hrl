@@ -36,24 +36,18 @@
 
 %% WebSocket Subprotocol Name Registry
 %% https://www.iana.org/assignments/websocket/websocket.xml
--define(OCPP_PROTO_V12, ocpp12).
--define(OCPP_PROTO_V15, ocpp15).
 -define(OCPP_PROTO_V16, ocpp16).
 -define(OCPP_PROTO_V20, ocpp20).
 -define(OCPP_PROTO_V201, ocpp201).
 -define(OCPP_PROTO_V21, ocpp21).
 
 -type ocpp_protocol_version_atom() ::
-        ?OCPP_PROTO_V12
-        | ?OCPP_PROTO_V15
-        | ?OCPP_PROTO_V16
+        ?OCPP_PROTO_V16
         | ?OCPP_PROTO_V20
         | ?OCPP_PROTO_V201
         | ?OCPP_PROTO_V21.
 
 -define(OCPP_PROTO_TO_ATOM(Proto), case Proto of
-    <<"ocpp1.2">> -> ?OCPP_PROTO_V12;
-    <<"ocpp1.5">> -> ?OCPP_PROTO_V15;
     <<"ocpp1.6">> -> ?OCPP_PROTO_V16;
     <<"ocpp2.0">> -> ?OCPP_PROTO_V20;
     <<"ocpp2.0.1">> -> ?OCPP_PROTO_V201;

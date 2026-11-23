@@ -107,9 +107,7 @@ emit_connection_info(Items, Ref, AggregatorPid, Pids) ->
 %%
 
 init_global_counters() ->
-    lists:foreach(fun init_global_counters/1, [?OCPP_PROTO_V12,
-                                               ?OCPP_PROTO_V15,
-                                               ?OCPP_PROTO_V16,
+    lists:foreach(fun init_global_counters/1, [?OCPP_PROTO_V16,
                                                ?OCPP_PROTO_V20,
                                                ?OCPP_PROTO_V201,
                                                ?OCPP_PROTO_V21]).

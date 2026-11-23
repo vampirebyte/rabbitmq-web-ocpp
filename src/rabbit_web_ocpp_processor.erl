@@ -155,6 +155,7 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, Se
             %% Register the connection and let the handler emit connection_created
             %% only now that the connection is fully established (consume_from_queue succeeded).
             ok = rabbit_networking:register_non_amqp_connection(self()),
+            rabbit_global_counters:publisher_created(ProtoVer),
             rabbit_global_counters:consumer_created(ProtoVer),
             self() ! connection_created,
 
@@ -173,6 +174,7 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, Se
 process_incoming(McOcpp = #ocpp_msg{},
                 State = #state{cfg = #cfg{exchange = ExchangeName = #resource{name = ExchangeNameBin},
                                                     client_id = ClientId,
+                                                    proto_ver = ProtoVer,
                                                     trace_state = TraceState,
                                                     conn_name = ConnName},
                                          auth_state = #auth_state{user = #user{username = Username}}}) ->
@@ -200,6 +202,7 @@ process_incoming(McOcpp = #ocpp_msg{},
                             ?LOG_WARNING("OCPP message from ClientId ~ts routed to 0 queues. "
                                         "Exchange: ~ts, routing key: ~ts",
                                         [ClientId, rabbit_misc:rs(ExchangeName), RoutingKey]),
+                            rabbit_global_counters:messages_unroutable_dropped(ProtoVer, 1),
                             {ok, State};
                         QNames when is_list(QNames) ->
                             %% 6. Trace (optional)
@@ -356,7 +359,8 @@ drain_frames(State = #state{pending_frames = Frames}) ->
 %% Terminate the processor
 -spec terminate(any(), rabbit_event:event_props(), state()) -> ok.
 terminate(Reason, Infos, State = #state{queue_states = QStates,
-                                        cfg = #cfg{client_id = ClientId}}) ->
+                                        cfg = #cfg{client_id = ClientId,
+                                                   proto_ver = ProtoVer}}) ->
     ?LOG_INFO("OCPP processor terminating. ClientId: ~ts, Reason: ~p", [ClientId, Reason]),
     %% Whatever the reason for the disconnect, tell the backends the charge
     %% point went offline with one final synthetic StatusNotification. On a
@@ -365,6 +369,8 @@ terminate(Reason, Infos, State = #state{queue_states = QStates,
     %% is never overtaken by this one.
     publish_offline_status(State),
     ok = rabbit_queue_type:close(QStates), % Stop consuming
+    rabbit_global_counters:publisher_deleted(ProtoVer),
+    rabbit_global_counters:consumer_deleted(ProtoVer),
     rabbit_core_metrics:connection_closed(self()),
     rabbit_event:notify(connection_closed, Infos),
     ok = rabbit_networking:unregister_non_amqp_connection(self()),
@@ -485,7 +491,7 @@ handle_queue_actions([Action | Rest], State) ->
 %% by handle_info/2, which returns them directly to cowboy. This avoids the
 %% prior `self() ! {reply, Data}` indirection.
 deliver_to_client([], _AckRequired, State) -> State;
-deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
+deliver_to_client([{QName, QPid, QMsgId, Redelivered, Mc} | Rest], AckRequired,
                   State = #state{cfg = #cfg{client_id = ClientId,
                                             trace_state = TraceState, conn_name = ConnName,
                                             consumer_tag = ConsumerTag},
@@ -496,9 +502,10 @@ deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
         case mc:protocol_state(McOcpp) of
              #ocpp_msg{payload = BinaryPayload} when is_binary(BinaryPayload) ->
                 ?LOG_DEBUG("OCPP delivering message to ~ts for QMsgId ~p", [ClientId, QMsgId]),
-                rabbit_trace:tap_out({QName, QPid, QMsgId, _Redelivered, Mc}, ConnName, User#user.username, TraceState),
+                rabbit_trace:tap_out({QName, QPid, QMsgId, Redelivered, Mc}, ConnName, User#user.username, TraceState),
                 {ok, QStates1, Actions1} = rabbit_queue_type:settle(
                     QName, complete, ConsumerTag, [QMsgId], QStates0),
+                message_delivered(QName, Redelivered, State),
                 State1 = buffer_frame({text, BinaryPayload}, State#state{queue_states = QStates1}),
                 State2 = handle_queue_actions(Actions1, State1),
                 ok = maybe_notify_sent(QName, QPid, State2),
@@ -527,6 +534,23 @@ deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
 
 buffer_frame(Frame, State = #state{pending_frames = Frames}) ->
     State#state{pending_frames = [Frame | Frames]}.
+
+%% The message is settled as soon as it is sent, so it counts as both
+%% delivered with a manual ack and acknowledged.
+message_delivered(QName, Redelivered, #state{queue_states = QStates,
+                                             cfg = #cfg{proto_ver = ProtoVer}}) ->
+    case rabbit_queue_type:module(QName, QStates) of
+        {ok, QType} ->
+            rabbit_global_counters:messages_delivered(ProtoVer, QType, 1),
+            rabbit_global_counters:messages_delivered_consume_manual_ack(ProtoVer, QType, 1),
+            rabbit_global_counters:messages_acknowledged(ProtoVer, QType, 1),
+            case Redelivered of
+                true -> rabbit_global_counters:messages_redelivered(ProtoVer, QType, 1);
+                false -> ok
+            end;
+        _ ->
+            ok
+    end.
 
 maybe_notify_sent(QName, QPid, #state{queue_states = QStates}) ->
     case rabbit_queue_type:module(QName, QStates) of
@@ -824,12 +848,14 @@ format_status(#state{cfg = Cfg, queue_states = QStates, auth_state = AuthState})
 %% @doc Handles an incoming WebSocket text frame, decodes JSON, and validates the OCPP message structure.
 %% Returns {ok, #ocpp_msg{}} | {error, Reason :: binary()}.
 -spec handle_text_frame(binary(), state()) -> {ok, #ocpp_msg{}, state()} | {error, binary()}.
-handle_text_frame(Data, State = #state{cfg = #cfg{client_id = ClientId}}) ->
+handle_text_frame(Data, State = #state{cfg = #cfg{client_id = ClientId,
+                                                  proto_ver = ProtoVer}}) ->
     try json:decode(Data) of
         Decoded when is_list(Decoded) ->
             % Successfully decoded a JSON list, validate its structure
             case process_decoded_message(Decoded) of
                 {ok, ValidatedList} ->
+                    rabbit_global_counters:messages_received(ProtoVer, 1),
                     UpdatedState = maybe_update_props_from_message(ValidatedList, State),
                     % Create mc_ocpp message
                     {ok, #ocpp_msg{
@@ -1033,8 +1059,6 @@ process_decoded_message(Decoded) ->
     {error, <<"Invalid OCPP message structure">>}.
 
 -spec proto_version_tuple(ocpp_protocol_version_atom() | undefined) -> tuple() | undefined.
-proto_version_tuple(?OCPP_PROTO_V12) -> {1, 2};
-proto_version_tuple(?OCPP_PROTO_V15) -> {1, 5};
 proto_version_tuple(?OCPP_PROTO_V16) -> {1, 6};
 proto_version_tuple(?OCPP_PROTO_V20) -> {2, 0};
 proto_version_tuple(?OCPP_PROTO_V201) -> {2, 0, 1};
