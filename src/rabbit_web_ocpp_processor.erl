@@ -1040,7 +1040,6 @@ info(client_properties, #state{cfg = #cfg{client_id = ClientId,
     Result;
 info(channel_max, _) -> 0;
 info(node, _) -> node();
-info(frame_max, _) -> 0; % Not applicable like MQTT
 info(recv_oct, _) -> erlang:process_info(self(), message_queue_len); % Approx incoming? Needs better metric
 info(send_oct, _) -> 0; % Hard to track accurately here
 info(Other, #state{cfg=#cfg{client_id=ClientId}}) ->

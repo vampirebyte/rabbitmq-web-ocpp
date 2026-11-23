@@ -180,6 +180,11 @@ end}.
 {mapping, "web_ocpp.ws_opts.compress", "rabbitmq_web_ocpp.cowboy_ws_opts.compress",
     [{datatype, {enum, [true, false]}}]
 }.
+%% Largest WebSocket frame accepted from a charge point, in bytes. Larger
+%% frames close the connection with code 1009 (message too big).
+%%
+%% {max_frame_size, 1048576}
+
 {mapping, "web_ocpp.ws_opts.max_frame_size", "rabbitmq_web_ocpp.cowboy_ws_opts.max_frame_size",
     [{datatype, integer}, {validators, ["non_negative_integer"]}]
 }.

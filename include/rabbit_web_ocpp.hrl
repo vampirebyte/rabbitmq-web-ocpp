@@ -8,6 +8,7 @@
 -define(APP_NAME, rabbitmq_web_ocpp).
 -define(PG_SCOPE, pg_scope_rabbitmq_web_ocpp_clientid).
 -define(DEFAULT_IDLE_TIMEOUT_MS, 60_000). %% 1 minute
+-define(DEFAULT_MAX_FRAME_SIZE, 1_048_576). %% 1 MiB
 
 %% Default zlib parameters applied when websocket compression is enabled.
 %% Bounds permessage-deflate memory to ~30 kB per connection (deflate:

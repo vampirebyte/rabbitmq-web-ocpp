@@ -51,6 +51,7 @@
           auth_mechanism = <<"UNKNOWN">> :: binary(),
           conn_name :: option(binary()),
           idle_timeout :: timeout(), %% from cowboy, in seconds
+          frame_max = 0 :: non_neg_integer(), %% 0 when there is no limit
           proto_ver :: ocpp_protocol_version_atom()
          }).
 
@@ -122,7 +123,10 @@ init(Req, Opts) ->
                     %% permessage-deflate connection holds two zlib contexts for
                     %% its whole lifetime. When enabled, ?DEFAULT_DEFLATE_OPTS is
                     %% applied unless the operator supplies deflate_opts.
-                    WsOpts1     = maps:merge(#{compress => false, idle_timeout => IdleMs}, WsOpts0),
+                    WsOpts1     = maps:merge(#{compress => false,
+                                           idle_timeout => IdleMs,
+                                           max_frame_size => ?DEFAULT_MAX_FRAME_SIZE},
+                                         WsOpts0),
                     WsOpts      = case WsOpts1 of
                                       #{compress := true} ->
                                           maps:merge(#{deflate_opts => ?DEFAULT_DEFLATE_OPTS}, WsOpts1);
@@ -130,9 +134,14 @@ init(Req, Opts) ->
                                           WsOpts1
                                   end,
                     IdleSec     = case IdleMs of infinity -> 0; Ms -> Ms div 1000 end,
+                    FrameMax    = case maps:get(max_frame_size, WsOpts) of
+                                      infinity -> 0;
+                                      Size -> Size
+                                  end,
                     State = #state{socket = ProxyInfo, proto_ver = ProtocolVer, vhost = V2,
                                    user = User, authz_ctx = AuthzCtx1,
                                    client_id = CId, idle_timeout = IdleSec,
+                                   frame_max = FrameMax,
                                    ssl_login_name = SslLoginName,
                                    auth_mechanism = auth_mechanism(Username0, SslLoginName)},
                     {?MODULE, Req2, State, WsOpts};
@@ -706,6 +715,8 @@ i(state, S) ->
 i(connection_state, #state{connection_state = Val}) ->
     Val;
 i(timeout, #state{idle_timeout = Val}) ->
+    Val;
+i(frame_max, #state{frame_max = Val}) ->
     Val;
 i(Key, #state{proc_state = PState}) ->
     % Handle the rest of the keys from processor state
