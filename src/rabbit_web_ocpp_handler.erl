@@ -101,9 +101,11 @@ init(Req, Opts) ->
             Result = maybe
                 ok ?= check_vhost_exists(Vhost, ClientId, PeerIp),
                 ok ?= check_vhost_alive(Vhost),
+                ok ?= check_vhost_connection_limit(Vhost),
                 {ok, ProtoVer, Req1} ?= pick_protocol(Req, ClientId),
                 {ok, Username1, Password1} ?= check_credentials(ClientId, Username0, Password0, SslLoginName, PeerIp),
                 {ok, User0} ?= check_user_login(Vhost, Username1, Password1, ClientId, PeerIp, IsSsl),
+                ok ?= check_user_connection_limit(User0),
                 ok ?= check_user_loopback(User0, PeerIp),
                 ok ?= check_tls_only(User0, IsSsl, PeerIp),
                 AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>,
@@ -149,6 +151,8 @@ init(Req, Opts) ->
                     {ok, cowboy_req:reply(404, #{}, <<"Invalid Vhost">>, Req), RejState};
                 {error, vhost_down} ->
                     {ok, cowboy_req:reply(503, #{}, <<"Vhost is down">>, Req), RejState};
+                {error, connection_limit} ->
+                    {ok, cowboy_req:reply(429, #{}, <<"Connection limit reached">>, Req), RejState};
                 {error, invalid_subprotocol} ->
                     {ok, cowboy_req:reply(400, #{<<"connection">> => <<"close">>},
                                           <<"Unsupported or missing OCPP subprotocol">>, Req), RejState};
@@ -544,6 +548,26 @@ check_vhost_alive(Vhost) ->
         false ->
             ?LOG_ERROR("OCPP connection failed: vhost '~s' is down", [Vhost]),
             {error, vhost_down}
+    end.
+
+check_vhost_connection_limit(Vhost) ->
+    case rabbit_vhost_limit:is_over_connection_limit(Vhost) of
+        false ->
+            ok;
+        {true, Limit} ->
+            ?LOG_ERROR("OCPP connection failed: connection limit ~p is reached for vhost '~s'",
+                       [Limit, Vhost]),
+            {error, connection_limit}
+    end.
+
+check_user_connection_limit(#user{username = Username}) ->
+    case rabbit_auth_backend_internal:is_over_connection_limit(Username) of
+        false ->
+            ok;
+        {true, Limit} ->
+            ?LOG_ERROR("OCPP connection failed: connection limit ~p is reached for user '~s'",
+                       [Limit, Username]),
+            {error, connection_limit}
     end.
 
 check_vhost_access(Vhost, User, _ClientId, PeerIp, AuthzCtx) ->
