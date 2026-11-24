@@ -908,126 +908,98 @@ call_error(MsgId, ErrorCode, Description) ->
     CallError = [?OCPP_MESSAGE_TYPE_CALLERROR, MsgId, ErrorCode, Description, #{}],
     {text, iolist_to_binary(json:encode(CallError))}.
 
-%% Seamlessly update both ETS tables without causing 404 errors.
-%% connection_created_stats is owned by rabbit_mgmt_storage, which the
-%% management agent does not start when management_agent.disable_metrics_collector
-%% is set, so there is nothing to refresh in that case.
+%% Updates the client properties in the connection_created core metrics
+%% table, which the management agent copies to connection_created_stats once
+%% per connection, and in connection_created_stats if that copy was already
+%% made. connection_created_stats is owned by rabbit_mgmt_storage, which the
+%% management agent does not start when
+%% management_agent.disable_metrics_collector is set.
 -spec force_stats_refresh(state()) -> ok.
-force_stats_refresh(State) ->
-    case ets:whereis(connection_created_stats) of
-        undefined ->
-            ok;
-        Tid ->
-            force_stats_refresh(Tid, State)
-    end.
-
--spec force_stats_refresh(ets:tid(), state()) -> ok.
-force_stats_refresh(Tid, State = #state{cfg = #cfg{client_id = ClientId}}) ->
+force_stats_refresh(State = #state{cfg = #cfg{client_id = ClientId}}) ->
+    Pid = self(),
+    ClientProps = info(client_properties, State),
     try
-        Pid = self(),
-        %% Get fresh client properties from our state
-        FreshClientProps = info(client_properties, State),
-
-        % rabbit_core_metrics:connection_created(Pid, FreshClientProps),
-
-        % %% 1. Update connection_created table (source of truth)
-        % case ets:lookup(connection_created, Pid) of
-        %     [{Pid, OldInfos}] ->
-        %         UpdatedInfos = lists:keystore(client_properties, 1, OldInfos, 
-        %                                     {client_properties, FreshClientProps}),
-        %         ets:insert(connection_created, {Pid, UpdatedInfos}),
-        %         ?LOG_DEBUG("OCPP updated connection_created table for ~ts", [ClientId]);
-        %     [] ->
-        %         ?LOG_WARNING("OCPP connection ~ts not found in connection_created ETS", [ClientId])
-        % end,
-        
-        %% 2. Update connection_created_stats table (formatted version) in-place
-        case ets:lookup(Tid, Pid) of
-            [{Pid, ConnName, OldStatsInfos}] ->
-                %% Convert proplist to map format using the same function as management plugin
-                FormattedClientProps = rabbit_misc:amqp_table(FreshClientProps),
-                UpdatedStatsInfos = lists:keystore(client_properties, 1, OldStatsInfos,
-                                                 {client_properties, FormattedClientProps}),
-                ets:insert(Tid, {Pid, ConnName, UpdatedStatsInfos}),
-                ?LOG_DEBUG("OCPP updated connection_created_stats table for ~ts", [ClientId]);
+        case ets:lookup(connection_created, Pid) of
+            [{Pid, Infos}] ->
+                ets:insert(connection_created,
+                           {Pid, lists:keystore(client_properties, 1, Infos,
+                                                {client_properties, ClientProps})});
             [] ->
-                %% Stats entry doesn't exist yet - that's fine, it will be created on next collection
-                ?LOG_DEBUG("OCPP connection_created_stats entry not found for ~ts (will be created on next collection)", [ClientId])
+                ok
         end,
-        
-        % %% 3. Clear management cache to ensure API returns fresh data
-        % try
-        %     ProcName = rabbit_mgmt_db_cache:process_name(connections),
-        %     case whereis(ProcName) of
-        %         undefined -> ok;
-        %         CachePid -> gen_server:call(CachePid, purge_cache, 5000)
-        %     end
-        % catch _:_ -> ok end,
-        
-        ?LOG_DEBUG("OCPP seamlessly updated connection stats for ~ts", [ClientId])
-        
+        case ets:whereis(connection_created_stats) =/= undefined andalso
+             ets:lookup(connection_created_stats, Pid) of
+            [{Pid, ConnName, StatsInfos}] ->
+                Formatted = {client_properties, rabbit_misc:amqp_table(ClientProps)},
+                ets:insert(connection_created_stats,
+                           {Pid, ConnName,
+                            lists:keystore(client_properties, 1, StatsInfos, Formatted)});
+            _ ->
+                ok
+        end
     catch
-        Class:Reason:Stacktrace ->
-            ?LOG_WARNING("Failed to refresh connection stats for ~ts: ~p:~p~n~p",
-                         [ClientId, Class, Reason, Stacktrace])
+        Class:Reason ->
+            ?LOG_WARNING("Failed to refresh connection stats for ~ts: ~p:~p",
+                         [ClientId, Class, Reason])
     end,
     ok.
 
-%% @doc Updates state properties based on specific OCPP message actions.
-%% Currently handles BootNotification to update user_prop with device info.
+%% @doc Stores the vendor, model and firmware version from a BootNotification
+%% as the platform, product and version client properties, which the
+%% management UI displays in the client column of a connection.
+%%
+%% The status of each connector from a StatusNotification is stored as well.
+%% Only connector and EVSE IDs up to 4 are stored, because the charge point
+%% chooses the IDs and every update copies all properties to the stats tables.
 -spec maybe_update_props_from_message(list(), state()) -> state().
 maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"BootNotification">>, Payload],
-                                State = #state{cfg = Cfg = #cfg{user_prop = OldProps, proto_ver = ?OCPP_PROTO_V16}}) 
+                                State = #state{cfg = #cfg{proto_ver = ?OCPP_PROTO_V16}})
   when is_map(Payload) ->
-    try
-        NewPropsList = maps:to_list(Payload),
-        MergedProps = lists:foldl(
-          fun({K, V}, Acc) ->
-                  BinKey = rabbit_data_coercion:to_binary(K),
-                  BinVal = rabbit_data_coercion:to_binary(V),
-                  lists:keystore(BinKey, 1, Acc, {BinKey, longstr, BinVal})
-          end, OldProps, NewPropsList),
-        ?LOG_DEBUG("Updated user_prop from BootNotification: ~p", [MergedProps]),
-        %% IMPORTANT: Update state FIRST, then refresh stats with updated state
-        UpdatedState = State#state{cfg = Cfg#cfg{user_prop = MergedProps}},
-        force_stats_refresh(UpdatedState),
-        UpdatedState
-    catch
-        error:Reason ->
-            ?LOG_WARNING("Could not process BootNotification payload for user_prop update. Reason: ~p", [Reason]),
-            State
-    end;
-
-maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"Heartbeat">>, _Payload], State) ->
-    %% Could update last_heartbeat timestamp in user_prop
-    State;
-
-maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"StatusNotification">>, Payload], 
-                                State = #state{cfg = Cfg = #cfg{user_prop = OldProps, proto_ver = ?OCPP_PROTO_V16}})
-  when is_map(Payload) ->
-    %% Extract required fields from the Payload
-    case {maps:get(<<"connectorId">>, Payload, undefined),
-          maps:get(<<"status">>, Payload, undefined),
-          maps:get(<<"errorCode">>, Payload, undefined)} of
-        {ConnectorId, Status, ErrorCode} when is_integer(ConnectorId), is_binary(Status), is_binary(ErrorCode) ->
-            %% Construct the key and value for user_prop
-            ConnectorIdBin = erlang:integer_to_binary(ConnectorId),
-            Key = <<"statusConnectorId", ConnectorIdBin/binary>>,
-            %% Store a nested object with status and errorCode
-            Value = [{<<"status">>, Status}, {<<"errorCode">>, ErrorCode}],
-            UpdatedProps = lists:keystore(Key, 1, OldProps, {Key, longstr, Value}),
-            %% Update state and refresh stats
-            UpdatedState = State#state{cfg = Cfg#cfg{user_prop = UpdatedProps}},
-            force_stats_refresh(UpdatedState),
-            UpdatedState;
-        _ ->
-            %% If any field is missing or invalid, return the original state
-            State
-    end;
-
-%% Default case - no state update needed
+    update_props(string_props([{<<"platform">>, maps:get(<<"chargePointVendor">>, Payload, undefined)},
+                               {<<"product">>, maps:get(<<"chargePointModel">>, Payload, undefined)},
+                               {<<"version">>, maps:get(<<"firmwareVersion">>, Payload, undefined)}]),
+                 State);
+maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"BootNotification">>,
+                                 #{<<"chargingStation">> := Station}], State)
+  when is_map(Station) ->
+    update_props(string_props([{<<"platform">>, maps:get(<<"vendorName">>, Station, undefined)},
+                               {<<"product">>, maps:get(<<"model">>, Station, undefined)},
+                               {<<"version">>, maps:get(<<"firmwareVersion">>, Station, undefined)}]),
+                 State);
+maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"StatusNotification">>,
+                                 #{<<"connectorId">> := ConnectorId,
+                                   <<"status">> := Status,
+                                   <<"errorCode">> := ErrorCode}],
+                                State = #state{cfg = #cfg{proto_ver = ?OCPP_PROTO_V16}})
+  when is_integer(ConnectorId), ConnectorId >= 0, ConnectorId =< 4,
+       is_binary(Status), is_binary(ErrorCode) ->
+    Key = <<"statusConnectorId", (integer_to_binary(ConnectorId))/binary>>,
+    update_props([{Key, table, [{<<"status">>, longstr, Status},
+                                {<<"errorCode">>, longstr, ErrorCode}]}], State);
+maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"StatusNotification">>,
+                                 #{<<"evseId">> := EvseId,
+                                   <<"connectorId">> := ConnectorId,
+                                   <<"connectorStatus">> := Status}], State)
+  when is_integer(EvseId), EvseId >= 1, EvseId =< 4,
+       is_integer(ConnectorId), ConnectorId >= 1, ConnectorId =< 4,
+       is_binary(Status) ->
+    Key = <<"statusEvseId", (integer_to_binary(EvseId))/binary,
+            "ConnectorId", (integer_to_binary(ConnectorId))/binary>>,
+    update_props([{Key, table, [{<<"status">>, longstr, Status}]}], State);
 maybe_update_props_from_message(_DecodedList, State) ->
     State.
+
+%% Values that are missing or not strings are skipped.
+string_props(Props) ->
+    [{Key, longstr, Value} || {Key, Value} <- Props, is_binary(Value)].
+
+update_props(Props, State = #state{cfg = Cfg = #cfg{user_prop = OldProps}}) ->
+    NewProps = lists:foldl(fun({Key, _, _} = Prop, Acc) ->
+                                   lists:keystore(Key, 1, Acc, Prop)
+                           end, OldProps, Props),
+    UpdatedState = State#state{cfg = Cfg#cfg{user_prop = NewProps}},
+    force_stats_refresh(UpdatedState),
+    UpdatedState.
 
 -spec info(rabbit_types:info_key(), state()) -> any().
 info(host, #state{cfg = #cfg{ip_addr = Val}}) -> Val;
@@ -1046,10 +1018,8 @@ info(vhost, #state{cfg = #cfg{vhost = Val}}) -> Val;
 info(client_properties, #state{cfg = #cfg{client_id = ClientId,
                                           user_prop = Prop}}) ->
     ?LOG_DEBUG("OCPP client_properties for ~ts: ~p", [ClientId, Prop]),
-    L = [{chargePointId, longstr, ClientId},
-         {connection_name, longstr, <<"Charging Point">>}],
-    PropWithAtomKeys = [{binary_to_atom(K, utf8), T, V} || {K, T, V} <- Prop],
-    Result = L ++ PropWithAtomKeys,
+    Result = [{<<"chargePointId">>, longstr, ClientId},
+              {<<"connection_name">>, longstr, <<"Charging Point">>} | Prop],
     ?LOG_DEBUG("OCPP client_properties AFTER for ~ts: ~p", [ClientId, Result]),
     Result;
 info(channel_max, _) -> 0;
