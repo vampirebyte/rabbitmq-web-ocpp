@@ -230,9 +230,8 @@ process_incoming(McOcpp = #ocpp_msg{},
 reply_unroutable(#ocpp_msg{msg_type = ?OCPP_MESSAGE_TYPE_CALL, msg_id = MsgId,
                            action = Action}, State)
   when is_binary(Action) ->
-    CallError = [?OCPP_MESSAGE_TYPE_CALLERROR, MsgId, <<"NotImplemented">>,
-                 <<"No handler for action ", Action/binary>>, #{}],
-    buffer_frame({text, iolist_to_binary(json:encode(CallError))}, State);
+    buffer_frame(call_error(MsgId, <<"NotImplemented">>,
+                            <<"No handler for action ", Action/binary>>), State);
 reply_unroutable(_, State) ->
     State.
 
@@ -469,15 +468,6 @@ generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action},
 
     %% Construct routing key: ocpp<protocolver>.<actionname>.req|conf|error
     <<ProtoVerBin/binary, ".", ActionBin/binary, ".", MsgTypeBin/binary>>.
-
-%% @doc Extracts relevant metadata from a parsed OCPP message list.
-% -spec extract_ocpp_metadata(list()) -> {ok, MsgId :: binary(), Action :: binary() | undefined} | {error, term()}.
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_CALL, MsgId, Action, _Payload]) when is_binary(MsgId), is_binary(Action) -> {ok, MsgId, Action};
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_CALLRESULT, MsgId, _Payload]) when is_binary(MsgId) -> {ok, MsgId, undefined};
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_CALLERROR, MsgId, _EC, _ED, _EDet]) when is_binary(MsgId) -> {ok, MsgId, undefined};
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_SEND, MsgId, Action, _Payload]) when is_binary(MsgId), is_binary(Action) -> {ok, MsgId, Action}; % OCPP 2.1
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_CALLRESULTERROR, MsgId, _EC, _ED, _EDet]) when is_binary(MsgId) -> {ok, MsgId, undefined}; % OCPP 2.1
-% extract_ocpp_metadata(Other) -> {error, {invalid_ocpp_list_for_metadata, Other}}.
 
 %% Handle actions resulting from queue events (deliveries, etc.)
 handle_queue_actions([], State) -> State;
@@ -857,43 +847,66 @@ format_status(#state{cfg = Cfg, queue_states = QStates, auth_state = AuthState})
       queue_states => rabbit_queue_type:format_status(QStates), % Delegate queue status
       auth_state => AuthState}. % Include auth info
 
-%% @doc Handles an incoming WebSocket text frame, decodes JSON, and validates the OCPP message structure.
-%% Returns {ok, #ocpp_msg{}} | {error, Reason :: binary()}.
--spec handle_text_frame(binary(), state()) -> {ok, #ocpp_msg{}, state()} | {error, binary()}.
+%% Decodes and checks a text frame from the charge point. Invalid messages are
+%% dropped: a CALL gets a CALLERROR and the connection stays open
+%% [OCPP 2.1 part 4 §4.2.3].
+-spec handle_text_frame(binary(), state()) ->
+    {ok, #ocpp_msg{}, state()} | {drop, [cowboy_websocket:frame()], state()}.
 handle_text_frame(Data, State = #state{cfg = #cfg{client_id = ClientId,
                                                   proto_ver = ProtoVer}}) ->
     try json:decode(Data) of
-        Decoded when is_list(Decoded) ->
-            % Successfully decoded a JSON list, validate its structure
+        Decoded ->
             case process_decoded_message(Decoded) of
-                {ok, ValidatedList} ->
+                {ok, MsgType, MsgId, Action} ->
                     rabbit_global_counters:messages_received(ProtoVer, 1),
-                    UpdatedState = maybe_update_props_from_message(ValidatedList, State),
-                    % Create mc_ocpp message
-                    {ok, #ocpp_msg{
-                        client_id = ClientId,
-                        msg_type = lists:nth(1, ValidatedList),
-                        msg_id = rabbit_data_coercion:to_binary(lists:nth(2, ValidatedList)),
-                        action = case ValidatedList of
-                                    [_Type, _MsgId, Action | _] when is_binary(Action) -> Action;
-                                    _ -> undefined
-                                 end,
-                        payload = Data
-                    }, UpdatedState};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        _Other ->
-            % Decoded JSON is not a list, which is invalid for OCPP
-            ?LOG_ERROR("Web OCPP received unexpected JSON structure (not an array): ~ts", [Data]),
-            {error, <<"Invalid JSON">>}
+                    UpdatedState = maybe_update_props_from_message(Decoded, State),
+                    {ok, #ocpp_msg{client_id = ClientId,
+                                   msg_type = MsgType,
+                                   msg_id = MsgId,
+                                   action = Action,
+                                   payload = Data}, UpdatedState};
+                unknown_type ->
+                    ?LOG_DEBUG("Web OCPP ignored a message of unknown type from ClientId ~ts",
+                               [ClientId]),
+                    {drop, [], State};
+                invalid ->
+                    ?LOG_WARNING("Web OCPP dropped an invalid OCPP message from ClientId ~ts "
+                                 "(~b bytes)", [ClientId, byte_size(Data)]),
+                    {drop, reply_invalid(Decoded, State), State}
+            end
     catch
-        % Handle JSON decoding errors
-        error:Reason:Stacktrace ->
-            ?LOG_ERROR("Web OCPP failed to decode JSON. Reason: ~tp, Data: ~ts, Stacktrace: ~tp",
-                       [Reason, Data, Stacktrace]),
-            {error, <<"Invalid JSON">>}
+        error:Reason ->
+            ?LOG_WARNING("Web OCPP failed to decode JSON from ClientId ~ts (~b bytes): ~tp",
+                         [ClientId, byte_size(Data), Reason]),
+            {drop, [rpc_framework_error(undefined, State)], State}
     end.
+
+%% Only a CALL, or a message whose type cannot be read, gets an answer. The
+%% other message types are responses, or SEND messages, which must not be
+%% answered [OCPP 2.1 part 4 §4.2.4].
+reply_invalid([?OCPP_MESSAGE_TYPE_CALL, MsgId | _], State) ->
+    [rpc_framework_error(MsgId, State)];
+reply_invalid([Type | _], _State) when Type =/= ?OCPP_MESSAGE_TYPE_CALL ->
+    [];
+reply_invalid(_Decoded, State) ->
+    [rpc_framework_error(undefined, State)].
+
+%% A message ID that cannot be read is answered as "-1". OCPP 1.6 has no
+%% RpcFrameworkError code.
+rpc_framework_error(MsgId0, #state{cfg = #cfg{proto_ver = ProtoVer}}) ->
+    MsgId = case mc_util:is_valid_shortstr(MsgId0) of
+                true -> MsgId0;
+                false -> <<"-1">>
+            end,
+    ErrorCode = case ProtoVer of
+                    ?OCPP_PROTO_V16 -> <<"ProtocolError">>;
+                    _ -> <<"RpcFrameworkError">>
+                end,
+    call_error(MsgId, ErrorCode, <<"Invalid OCPP message">>).
+
+call_error(MsgId, ErrorCode, Description) ->
+    CallError = [?OCPP_MESSAGE_TYPE_CALLERROR, MsgId, ErrorCode, Description, #{}],
+    {text, iolist_to_binary(json:encode(CallError))}.
 
 %% Seamlessly update both ETS tables without causing 404 errors.
 %% connection_created_stats is owned by rabbit_mgmt_storage, which the
@@ -1047,28 +1060,50 @@ info(Other, #state{cfg=#cfg{client_id=ClientId}}) ->
     ?LOG_DEBUG("OCPP info request for ~ts: ~p", [ClientId, Other]),
     undefined.
 
-%% Internal function to validate the structure of the already decoded list based on OCPP message type.
-%% Returns {ok, DecodedList :: list()} | {error, Reason :: binary()}.
--spec process_decoded_message(list()) -> {ok, list()} | {error, binary()}.
-process_decoded_message([?OCPP_MESSAGE_TYPE_CALL, MessageId, Action, _Payload] = Decoded) ->
-    ?LOG_DEBUG("Validated CALL: Id=~tp, Action=~tp", [MessageId, Action]), % Log less verbosely here
-    {ok, Decoded};
-process_decoded_message([?OCPP_MESSAGE_TYPE_CALLRESULT, MessageId, _Payload] = Decoded) ->
-     ?LOG_DEBUG("Validated CALLRESULT: Id=~tp", [MessageId]),
-    {ok, Decoded};
-process_decoded_message([?OCPP_MESSAGE_TYPE_CALLERROR, MessageId, ErrorCode, _ErrorDescription, _ErrorDetails] = Decoded) ->
-     ?LOG_DEBUG("Validated CALLERROR: Id=~tp, Code=~tp", [MessageId, ErrorCode]),
-    {ok, Decoded};
-process_decoded_message([?OCPP_MESSAGE_TYPE_CALLRESULTERROR, MessageId, ErrorCode, _ErrorDescription, _ErrorDetails] = Decoded) -> % OCPP 2.1
-     ?LOG_DEBUG("Validated CALLRESULTERROR: Id=~tp, Code=~tp", [MessageId, ErrorCode]),
-    {ok, Decoded};
-process_decoded_message([?OCPP_MESSAGE_TYPE_SEND, MessageId, Action, _Payload] = Decoded) -> % OCPP 2.1
-     ?LOG_DEBUG("Validated SEND: Id=~tp, Action=~tp", [MessageId, Action]),
-    {ok, Decoded};
-process_decoded_message(Decoded) ->
-    % The list structure doesn't match any known OCPP message type/format
-    ?LOG_ERROR("Received invalid OCPP message structure: ~tp", [Decoded]),
-    {error, <<"Invalid OCPP message structure">>}.
+%% The message ID becomes the correlation_id property, which AMQP 0-9-1
+%% workers can only read if it is a valid short string. OCPP-J allows at most
+%% 36 characters, so that a UUID fits [OCPP 2.1 part 4 §4.1.4]. The check here
+%% is less strict, because longer IDs cause no harm.
+%%
+%% For CALLERROR and CALLRESULTERROR, the error code takes the place of the
+%% action.
+-spec process_decoded_message(term()) ->
+    {ok, integer(), binary(), binary() | undefined} | unknown_type | invalid.
+process_decoded_message([Type | _])
+  when is_integer(Type),
+       (Type < ?OCPP_MESSAGE_TYPE_CALL orelse Type > ?OCPP_MESSAGE_TYPE_SEND) ->
+    unknown_type;
+process_decoded_message([?OCPP_MESSAGE_TYPE_CALL, MessageId, Action, _Payload]) ->
+    ocpp_message(?OCPP_MESSAGE_TYPE_CALL, MessageId, Action);
+%% A signed message has an extension object before the action
+%% [OCPP 2.1 part 4 §7.1].
+process_decoded_message([?OCPP_MESSAGE_TYPE_CALL, MessageId, Extension, Action, _Payload])
+  when is_map(Extension) ->
+    ocpp_message(?OCPP_MESSAGE_TYPE_CALL, MessageId, Action);
+process_decoded_message([?OCPP_MESSAGE_TYPE_CALLRESULT, MessageId, _Payload]) ->
+    ocpp_message(?OCPP_MESSAGE_TYPE_CALLRESULT, MessageId, undefined);
+process_decoded_message([?OCPP_MESSAGE_TYPE_CALLERROR, MessageId, ErrorCode, _ErrorDescription, _ErrorDetails]) ->
+    ocpp_message(?OCPP_MESSAGE_TYPE_CALLERROR, MessageId, ErrorCode);
+process_decoded_message([?OCPP_MESSAGE_TYPE_CALLRESULTERROR, MessageId, ErrorCode, _ErrorDescription, _ErrorDetails]) ->
+    ocpp_message(?OCPP_MESSAGE_TYPE_CALLRESULTERROR, MessageId, ErrorCode);
+process_decoded_message([?OCPP_MESSAGE_TYPE_SEND, MessageId, Action, _Payload]) ->
+    ocpp_message(?OCPP_MESSAGE_TYPE_SEND, MessageId, Action);
+process_decoded_message([?OCPP_MESSAGE_TYPE_SEND, MessageId, Extension, Action, _Payload])
+  when is_map(Extension) ->
+    ocpp_message(?OCPP_MESSAGE_TYPE_SEND, MessageId, Action);
+process_decoded_message(_Decoded) ->
+    invalid.
+
+%% JSON null decodes to the atom null, so an undefined action can only come
+%% from a CALLRESULT.
+ocpp_message(Type, MessageId, Action)
+  when is_binary(Action) orelse Action =:= undefined ->
+    case mc_util:is_valid_shortstr(MessageId) of
+        true -> {ok, Type, MessageId, Action};
+        false -> invalid
+    end;
+ocpp_message(_Type, _MessageId, _Action) ->
+    invalid.
 
 -spec proto_version_tuple(ocpp_protocol_version_atom() | undefined) -> tuple() | undefined.
 proto_version_tuple(?OCPP_PROTO_V16) -> {1, 6};

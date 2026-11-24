@@ -238,17 +238,8 @@ websocket_handle({text, Data}, State = #state{conn_name = ConnName, client_id = 
                                 end,
                     stop(State, CloseCode, Reason)
             end;
-        {error, Reason} ->
-            % Decoding or validation failed
-            ?LOG_ERROR("OCPP message handling failed (decode/validate) for ~p (~p). Reason: ~tp",
-                       [ClientId, ConnName, Reason]),
-            %% Determine close code based on reason
-            CloseCode = case Reason of
-                            <<"Invalid JSON">> -> ?CLOSE_INVALID_PAYLOAD;
-                            <<"Invalid OCPP message structure">> -> ?CLOSE_PROTOCOL_ERROR; % Or maybe 1007?
-                            _ -> ?CLOSE_PROTOCOL_ERROR % Default to protocol error
-                        end,
-            stop(State, CloseCode, Reason)
+        {drop, Frames, ProcState1} ->
+            {Frames, State#state{proc_state = ProcState1}, hibernate}
     end;
 %% Silently ignore ping and pong frames as Cowboy will automatically reply to ping frames.
 websocket_handle({Ping, _}, State)
