@@ -105,13 +105,8 @@ end).
          send_cnt,
          send_oct,
          send_pend,
-         clean_sess,
-         will_msg,
-         retainer_pid,
          exchange,
-         prefetch,
-         messages_unconfirmed,
-         messages_unacknowledged
+         prefetch_count
         ]).
 
 %% Connection opened or closed.

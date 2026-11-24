@@ -81,7 +81,10 @@ init([]) ->
 list_connections() ->
     PlainPids = rabbit_networking:list_local_connections_of_protocol(?OCPP_TCP_PROTOCOL),
     TLSPids   = rabbit_networking:list_local_connections_of_protocol(?OCPP_TLS_PROTOCOL),
-    PlainPids ++ TLSPids.
+    %% HTTP connections that have not become OCPP sessions do not answer
+    %% info calls, so the CLI would wait for them until the call times out.
+    Sessions = maps:from_keys(rabbit_networking:local_non_amqp_connections(), true),
+    [Pid || Pid <- PlainPids ++ TLSPids, is_map_key(Pid, Sessions)].
 
 -spec emit_connection_info_all([node()], rabbit_types:info_keys(), reference(), pid()) -> term().
 emit_connection_info_all(Nodes, Items, Ref, AggregatorPid) ->

@@ -1025,6 +1025,7 @@ info(connected_at, #state{cfg = #cfg{connected_at = Val}}) -> Val;
 info(user_who_performed_action, S) ->
     info(user, S);
 info(prefetch_count, #state{cfg = #cfg{prefetch = Val}}) -> Val;
+info(exchange, #state{cfg = #cfg{exchange = #resource{name = Val}}}) -> Val;
 info(user, #state{auth_state = #auth_state{user = #user{username = Val}}}) -> Val;
 info(user_property, #state{cfg = #cfg{user_prop = Val}}) -> Val;
 info(vhost, #state{cfg = #cfg{vhost = Val}}) -> Val;
